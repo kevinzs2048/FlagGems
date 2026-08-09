@@ -98,6 +98,8 @@ class DeviceDetector:
             "FLAGGEMS_VENDOR",
             "GEMS_BACKEND",
             "FLAGGEMS_BACKEND",
+            # Kept for compatibility with the Triton-CPU integration scripts.
+            "FLAGGEMS_VENDOR_NAME",
         )
         for key in env_keys:
             if key in os.environ:
