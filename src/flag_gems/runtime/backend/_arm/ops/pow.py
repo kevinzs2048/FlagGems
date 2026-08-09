@@ -12,6 +12,8 @@ from flag_gems.ops.pow import pow_tensor_scalar_ as base_pow_tensor_scalar_
 from flag_gems.ops.pow import pow_tensor_tensor as base_pow_tensor_tensor
 from flag_gems.ops.pow import pow_tensor_tensor_ as base_pow_tensor_tensor_
 
+from ..vector_config import ELEMENTWISE_ROLLED_TILE, SINGLE_PROGRAM_MAX_ELEMENTS
+
 # For small tensors, bypass Triton entirely via numpy (zero-copy views).
 _POW_NATIVE_THRESHOLD = 4096
 
@@ -27,8 +29,14 @@ def _pow_square_kernel(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     num_prog = tl.num_programs(0)
     start = pid * BLOCK_SIZE
     step = num_prog * BLOCK_SIZE
-    for off in range(start, n_elements, step):
-        offsets = off + tl.arange(0, BLOCK_SIZE)
+    lanes = tl.arange(0, BLOCK_SIZE)
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for off in range(start, full_elements, step):
+        offsets = off + lanes
+        x = tl.load(x_ptr + offsets)
+        tl.store(out_ptr + offsets, x * x)
+    if pid == 0 and full_elements < n_elements:
+        offsets = full_elements + lanes
         mask = offsets < n_elements
         x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
         tl.store(out_ptr + offsets, x * x, mask=mask)
@@ -39,8 +47,13 @@ def _pow_square_single_program_kernel(
     x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr
 ):
     offs = tl.arange(0, BLOCK_SIZE)
-    for base in range(0, n_elements, BLOCK_SIZE):
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for base in range(0, full_elements, BLOCK_SIZE):
         idx = base + offs
+        x = tl.load(x_ptr + idx)
+        tl.store(out_ptr + idx, x * x)
+    if full_elements < n_elements:
+        idx = full_elements + offs
         mask = idx < n_elements
         x = tl.load(x_ptr + idx, mask=mask, other=0.0)
         tl.store(out_ptr + idx, x * x, mask=mask)
@@ -132,8 +145,15 @@ def _pow_sqrt_kernel(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     num_prog = tl.num_programs(0)
     start = pid * BLOCK_SIZE
     step = num_prog * BLOCK_SIZE
-    for off in range(start, n_elements, step):
-        offsets = off + tl.arange(0, BLOCK_SIZE)
+    lanes = tl.arange(0, BLOCK_SIZE)
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for off in range(start, full_elements, step):
+        offsets = off + lanes
+        x = tl.load(x_ptr + offsets)
+        y = tl.sqrt(x.to(tl.float32)).to(out_ptr.dtype.element_ty)
+        tl.store(out_ptr + offsets, y)
+    if pid == 0 and full_elements < n_elements:
+        offsets = full_elements + lanes
         mask = offsets < n_elements
         x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
         y = tl.sqrt(x.to(tl.float32)).to(out_ptr.dtype.element_ty)
@@ -145,8 +165,14 @@ def _pow_sqrt_single_program_kernel(
     x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr
 ):
     offs = tl.arange(0, BLOCK_SIZE)
-    for base in range(0, n_elements, BLOCK_SIZE):
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for base in range(0, full_elements, BLOCK_SIZE):
         idx = base + offs
+        x = tl.load(x_ptr + idx)
+        y = tl.sqrt(x.to(tl.float32)).to(out_ptr.dtype.element_ty)
+        tl.store(out_ptr + idx, y)
+    if full_elements < n_elements:
+        idx = full_elements + offs
         mask = idx < n_elements
         x = tl.load(x_ptr + idx, mask=mask, other=0.0)
         y = tl.sqrt(x.to(tl.float32)).to(out_ptr.dtype.element_ty)
@@ -159,8 +185,15 @@ def _pow_rsqrt_kernel(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     num_prog = tl.num_programs(0)
     start = pid * BLOCK_SIZE
     step = num_prog * BLOCK_SIZE
-    for off in range(start, n_elements, step):
-        offsets = off + tl.arange(0, BLOCK_SIZE)
+    lanes = tl.arange(0, BLOCK_SIZE)
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for off in range(start, full_elements, step):
+        offsets = off + lanes
+        x = tl.load(x_ptr + offsets)
+        y = (1.0 / tl.sqrt(x.to(tl.float32))).to(out_ptr.dtype.element_ty)
+        tl.store(out_ptr + offsets, y)
+    if pid == 0 and full_elements < n_elements:
+        offsets = full_elements + lanes
         mask = offsets < n_elements
         x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
         y = (1.0 / tl.sqrt(x.to(tl.float32))).to(out_ptr.dtype.element_ty)
@@ -172,8 +205,14 @@ def _pow_rsqrt_single_program_kernel(
     x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr
 ):
     offs = tl.arange(0, BLOCK_SIZE)
-    for base in range(0, n_elements, BLOCK_SIZE):
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for base in range(0, full_elements, BLOCK_SIZE):
         idx = base + offs
+        x = tl.load(x_ptr + idx)
+        y = (1.0 / tl.sqrt(x.to(tl.float32))).to(out_ptr.dtype.element_ty)
+        tl.store(out_ptr + idx, y)
+    if full_elements < n_elements:
+        idx = full_elements + offs
         mask = idx < n_elements
         x = tl.load(x_ptr + idx, mask=mask, other=0.0)
         y = (1.0 / tl.sqrt(x.to(tl.float32))).to(out_ptr.dtype.element_ty)
@@ -196,11 +235,10 @@ def _select_block_size(n_elements, dtype):
 
 
 def _single_program_block(n_elements):
-    if n_elements <= 256:
-        return 32
-    if n_elements <= 2048:
-        return 128
-    return 256
+    return min(
+        ELEMENTWISE_ROLLED_TILE,
+        triton.next_power_of_2(max(n_elements, 1)),
+    )
 
 
 def _maybe_scalar(v):
@@ -228,7 +266,10 @@ def _is_supported_tensor(t):
 def _launch_pow_kernel(
     multi_kernel, single_kernel, x, out_tensor, n_elements, block_size
 ):
-    if 1 < n_elements <= 8192:
+    if 1 < n_elements and (
+        torch.get_num_threads() == 1
+        or n_elements <= SINGLE_PROGRAM_MAX_ELEMENTS
+    ):
         single_block = _single_program_block(n_elements)
         single_kernel[(1,)](
             x,
@@ -239,7 +280,13 @@ def _launch_pow_kernel(
             num_stages=1,
         )
         return
-    grid = (triton.cdiv(n_elements, block_size),)
+    block_size = _single_program_block(n_elements)
+    grid = (
+        min(
+            max(1, torch.get_num_threads()),
+            triton.cdiv(n_elements, block_size),
+        ),
+    )
     multi_kernel[grid](
         x,
         out_tensor,
@@ -433,6 +480,7 @@ def pow_tensor_tensor(A, exponent):
         isinstance(A, torch.Tensor)
         and A.numel() < _POW_NATIVE_THRESHOLD
         and A.is_contiguous()
+        and A.dtype is not torch.bfloat16
     ):
         return torch.from_numpy(
             np.power(
@@ -470,6 +518,7 @@ def pow_tensor_scalar(A, exponent):
         isinstance(A, torch.Tensor)
         and A.numel() < _POW_NATIVE_THRESHOLD
         and A.is_contiguous()
+        and A.dtype is not torch.bfloat16
     ):
         exp = (
             float(exponent)

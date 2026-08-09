@@ -6,6 +6,8 @@ import triton.language as tl
 
 from flag_gems.utils import pointwise_dynamic
 
+from ..vector_config import ELEMENTWISE_ROLLED_TILE, SINGLE_PROGRAM_MAX_ELEMENTS
+
 
 @pointwise_dynamic(
     is_tensor=[True, True, True],
@@ -14,6 +16,36 @@ from flag_gems.utils import pointwise_dynamic
 @triton.jit
 def where_inner(condition, self, other):
     return tl.where(condition, self, other)
+
+
+@triton.jit(do_not_specialize=["n_elements"])
+def _where_tensor_tensor_kernel(
+    condition_ptr,
+    self_ptr,
+    other_ptr,
+    out_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_programs = tl.num_programs(0)
+    lanes = tl.arange(0, BLOCK_SIZE)
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for base in range(
+        pid * BLOCK_SIZE, full_elements, num_programs * BLOCK_SIZE
+    ):
+        idx = base + lanes
+        cond = tl.load(condition_ptr + idx).to(tl.int1)
+        lhs = tl.load(self_ptr + idx)
+        rhs = tl.load(other_ptr + idx)
+        tl.store(out_ptr + idx, tl.where(cond, lhs, rhs))
+    if pid == 0 and full_elements < n_elements:
+        idx = full_elements + lanes
+        mask = idx < n_elements
+        cond = tl.load(condition_ptr + idx, mask=mask, other=0).to(tl.int1)
+        lhs = tl.load(self_ptr + idx, mask=mask, other=0.0)
+        rhs = tl.load(other_ptr + idx, mask=mask, other=0.0)
+        tl.store(out_ptr + idx, tl.where(cond, lhs, rhs), mask=mask)
 
 
 @triton.jit(do_not_specialize=["scalar", "n_elements"])
@@ -62,13 +94,18 @@ def _where_scalar_self_single_program_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     offs = tl.arange(0, BLOCK_SIZE)
-    for base in range(0, n_elements, BLOCK_SIZE):
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for base in range(0, full_elements, BLOCK_SIZE):
         idx = base + offs
+        cond = tl.load(condition_ptr + idx).to(tl.int1)
+        other = tl.load(other_ptr + idx)
+        tl.store(out_ptr + idx, tl.where(cond, scalar, other))
+    if full_elements < n_elements:
+        idx = full_elements + offs
         mask = idx < n_elements
         cond = tl.load(condition_ptr + idx, mask=mask, other=0).to(tl.int1)
         other = tl.load(other_ptr + idx, mask=mask, other=0.0)
-        out = tl.where(cond, scalar, other)
-        tl.store(out_ptr + idx, out, mask=mask)
+        tl.store(out_ptr + idx, tl.where(cond, scalar, other), mask=mask)
 
 
 @triton.jit(do_not_specialize=["scalar", "n_elements"])
@@ -81,13 +118,18 @@ def _where_scalar_other_single_program_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     offs = tl.arange(0, BLOCK_SIZE)
-    for base in range(0, n_elements, BLOCK_SIZE):
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for base in range(0, full_elements, BLOCK_SIZE):
         idx = base + offs
+        cond = tl.load(condition_ptr + idx).to(tl.int1)
+        self_tensor = tl.load(self_ptr + idx)
+        tl.store(out_ptr + idx, tl.where(cond, self_tensor, scalar))
+    if full_elements < n_elements:
+        idx = full_elements + offs
         mask = idx < n_elements
         cond = tl.load(condition_ptr + idx, mask=mask, other=0).to(tl.int1)
         self_tensor = tl.load(self_ptr + idx, mask=mask, other=0.0)
-        out = tl.where(cond, self_tensor, scalar)
-        tl.store(out_ptr + idx, out, mask=mask)
+        tl.store(out_ptr + idx, tl.where(cond, self_tensor, scalar), mask=mask)
 
 
 def _as_scalar(v):
@@ -127,14 +169,21 @@ def _where_scalar_tensor_fastpath(condition, self, other, out):
         other_flat = other_tensor.view(-1)
         out_flat = out.view(-1)
         n = cond_flat.numel()
-        if n <= 262144:
+        if n > 1 and (
+            torch.get_num_threads() == 1
+            or n <= SINGLE_PROGRAM_MAX_ELEMENTS
+        ):
+            block_size = min(
+                ELEMENTWISE_ROLLED_TILE,
+                triton.next_power_of_2(n),
+            )
             _where_scalar_self_single_program_kernel[(1,)](
                 cond_flat,
                 other_flat,
                 out_flat,
                 float(self_scalar),
                 n,
-                BLOCK_SIZE=256,
+                BLOCK_SIZE=block_size,
                 num_warps=1,
                 num_stages=1,
             )
@@ -165,14 +214,21 @@ def _where_scalar_tensor_fastpath(condition, self, other, out):
         self_flat = self_tensor.view(-1)
         out_flat = out.view(-1)
         n = cond_flat.numel()
-        if n <= 262144:
+        if n > 1 and (
+            torch.get_num_threads() == 1
+            or n <= SINGLE_PROGRAM_MAX_ELEMENTS
+        ):
+            block_size = min(
+                ELEMENTWISE_ROLLED_TILE,
+                triton.next_power_of_2(n),
+            )
             _where_scalar_other_single_program_kernel[(1,)](
                 cond_flat,
                 self_flat,
                 out_flat,
                 float(other_scalar),
                 n,
-                BLOCK_SIZE=256,
+                BLOCK_SIZE=block_size,
                 num_warps=1,
                 num_stages=1,
             )
@@ -191,6 +247,51 @@ def _where_scalar_tensor_fastpath(condition, self, other, out):
         return True
 
     return False
+
+
+def _where_tensor_tensor_fastpath(condition, self, other, out):
+    if not all(
+        isinstance(value, torch.Tensor)
+        for value in (condition, self, other, out)
+    ):
+        return False
+    if condition.dtype is not torch.bool or condition.device.type != "cpu":
+        return False
+    if self.dtype != other.dtype or self.dtype != out.dtype:
+        return False
+    if not all(value.is_contiguous() for value in (condition, self, other, out)):
+        return False
+    if not (
+        condition.shape == self.shape == other.shape == out.shape
+    ):
+        return False
+
+    n_elements = out.numel()
+    if n_elements == 0:
+        return True
+    block_size = min(
+        ELEMENTWISE_ROLLED_TILE,
+        triton.next_power_of_2(max(n_elements, 1)),
+    )
+    programs = (
+        1
+        if n_elements <= SINGLE_PROGRAM_MAX_ELEMENTS
+        else min(
+            max(1, torch.get_num_threads()),
+            triton.cdiv(n_elements, block_size),
+        )
+    )
+    _where_tensor_tensor_kernel[(programs,)](
+        condition.view(-1),
+        self.view(-1),
+        other.view(-1),
+        out.view(-1),
+        n_elements,
+        BLOCK_SIZE=block_size,
+        num_warps=1,
+        num_stages=1,
+    )
+    return True
 
 
 def where_self_out(condition, self, other, out=None):
@@ -238,6 +339,9 @@ def where_self_out(condition, self, other, out=None):
         out = torch.empty(out_shape, dtype=result_type, device=c.device)
 
     if _where_scalar_tensor_fastpath(c, a, b, out):
+        return out
+
+    if _where_tensor_tensor_fastpath(c, a, b, out):
         return out
 
     ndim = max(c.ndim, a.ndim, b.ndim)

@@ -6,6 +6,8 @@ import triton.language as tl
 
 from flag_gems.utils import broadcastable_to
 
+from ..vector_config import ELEMENTWISE_ROLLED_TILE, SINGLE_PROGRAM_MAX_ELEMENTS
+
 
 @triton.jit(do_not_specialize=["value", "n_elements"])
 def _masked_fill_kernel(
@@ -17,12 +19,22 @@ def _masked_fill_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    x = tl.load(inp_ptr + offsets, mask=mask, other=0.0)
-    m = tl.load(mask_ptr + offsets, mask=mask, other=0).to(tl.int1)
-    y = tl.where(m, value, x)
-    tl.store(out_ptr + offsets, y, mask=mask)
+    num_programs = tl.num_programs(0)
+    lanes = tl.arange(0, BLOCK_SIZE)
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for base in range(
+        pid * BLOCK_SIZE, full_elements, num_programs * BLOCK_SIZE
+    ):
+        idx = base + lanes
+        x = tl.load(inp_ptr + idx)
+        m = tl.load(mask_ptr + idx).to(tl.int1)
+        tl.store(out_ptr + idx, tl.where(m, value, x))
+    if pid == 0 and full_elements < n_elements:
+        idx = full_elements + lanes
+        mask = idx < n_elements
+        x = tl.load(inp_ptr + idx, mask=mask, other=0.0)
+        m = tl.load(mask_ptr + idx, mask=mask, other=0).to(tl.int1)
+        tl.store(out_ptr + idx, tl.where(m, value, x), mask=mask)
 
 
 @triton.jit(do_not_specialize=["value", "n_elements"])
@@ -35,13 +47,18 @@ def _masked_fill_single_program_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     offs = tl.arange(0, BLOCK_SIZE)
-    for base in range(0, n_elements, BLOCK_SIZE):
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for base in range(0, full_elements, BLOCK_SIZE):
         idx = base + offs
+        x = tl.load(inp_ptr + idx)
+        m = tl.load(mask_ptr + idx).to(tl.int1)
+        tl.store(out_ptr + idx, tl.where(m, value, x))
+    if full_elements < n_elements:
+        idx = full_elements + offs
         mask = idx < n_elements
         x = tl.load(inp_ptr + idx, mask=mask, other=0.0)
         m = tl.load(mask_ptr + idx, mask=mask, other=0).to(tl.int1)
-        y = tl.where(m, value, x)
-        tl.store(out_ptr + idx, y, mask=mask)
+        tl.store(out_ptr + idx, tl.where(m, value, x), mask=mask)
 
 
 @triton.jit(do_not_specialize=["value", "n_elements"])
@@ -53,12 +70,22 @@ def _masked_fill_inplace_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    x = tl.load(inp_ptr + offsets, mask=mask, other=0.0)
-    m = tl.load(mask_ptr + offsets, mask=mask, other=0).to(tl.int1)
-    y = tl.where(m, value, x)
-    tl.store(inp_ptr + offsets, y, mask=mask)
+    num_programs = tl.num_programs(0)
+    lanes = tl.arange(0, BLOCK_SIZE)
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for base in range(
+        pid * BLOCK_SIZE, full_elements, num_programs * BLOCK_SIZE
+    ):
+        idx = base + lanes
+        x = tl.load(inp_ptr + idx)
+        m = tl.load(mask_ptr + idx).to(tl.int1)
+        tl.store(inp_ptr + idx, tl.where(m, value, x))
+    if pid == 0 and full_elements < n_elements:
+        idx = full_elements + lanes
+        mask = idx < n_elements
+        x = tl.load(inp_ptr + idx, mask=mask, other=0.0)
+        m = tl.load(mask_ptr + idx, mask=mask, other=0).to(tl.int1)
+        tl.store(inp_ptr + idx, tl.where(m, value, x), mask=mask)
 
 
 @triton.jit(do_not_specialize=["value", "n_elements"])
@@ -70,13 +97,18 @@ def _masked_fill_inplace_single_program_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     offs = tl.arange(0, BLOCK_SIZE)
-    for base in range(0, n_elements, BLOCK_SIZE):
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for base in range(0, full_elements, BLOCK_SIZE):
         idx = base + offs
+        x = tl.load(inp_ptr + idx)
+        m = tl.load(mask_ptr + idx).to(tl.int1)
+        tl.store(inp_ptr + idx, tl.where(m, value, x))
+    if full_elements < n_elements:
+        idx = full_elements + offs
         mask = idx < n_elements
         x = tl.load(inp_ptr + idx, mask=mask, other=0.0)
         m = tl.load(mask_ptr + idx, mask=mask, other=0).to(tl.int1)
-        y = tl.where(m, value, x)
-        tl.store(inp_ptr + idx, y, mask=mask)
+        tl.store(inp_ptr + idx, tl.where(m, value, x), mask=mask)
 
 
 def _select_block_size(n_elements):
@@ -114,8 +146,14 @@ def _launch_masked_fill(inp, expand_mask, value, out):
     n_elements = inp.numel()
     if n_elements == 0:
         return
-    if 1 < n_elements <= 8192:
-        single_block = 32 if n_elements <= 4096 else 64
+    if 1 < n_elements and (
+        torch.get_num_threads() == 1
+        or n_elements <= SINGLE_PROGRAM_MAX_ELEMENTS
+    ):
+        single_block = min(
+            ELEMENTWISE_ROLLED_TILE,
+            triton.next_power_of_2(n_elements),
+        )
         _masked_fill_single_program_kernel[(1,)](
             inp,
             expand_mask,
@@ -128,8 +166,13 @@ def _launch_masked_fill(inp, expand_mask, value, out):
         )
         return
 
-    block_size = _select_block_size(n_elements)
-    grid = (triton.cdiv(n_elements, block_size),)
+    block_size = min(
+        ELEMENTWISE_ROLLED_TILE,
+        triton.next_power_of_2(n_elements),
+    )
+    grid = (
+        min(torch.get_num_threads(), triton.cdiv(n_elements, block_size)),
+    )
     _masked_fill_kernel[grid](
         inp,
         expand_mask,
@@ -146,8 +189,14 @@ def _launch_masked_fill_inplace(inp, expand_mask, value):
     n_elements = inp.numel()
     if n_elements == 0:
         return
-    if 1 < n_elements <= 8192:
-        single_block = 32 if n_elements <= 4096 else 64
+    if 1 < n_elements and (
+        torch.get_num_threads() == 1
+        or n_elements <= SINGLE_PROGRAM_MAX_ELEMENTS
+    ):
+        single_block = min(
+            ELEMENTWISE_ROLLED_TILE,
+            triton.next_power_of_2(n_elements),
+        )
         _masked_fill_inplace_single_program_kernel[(1,)](
             inp,
             expand_mask,
@@ -159,8 +208,13 @@ def _launch_masked_fill_inplace(inp, expand_mask, value):
         )
         return
 
-    block_size = _select_block_size(n_elements)
-    grid = (triton.cdiv(n_elements, block_size),)
+    block_size = min(
+        ELEMENTWISE_ROLLED_TILE,
+        triton.next_power_of_2(n_elements),
+    )
+    grid = (
+        min(torch.get_num_threads(), triton.cdiv(n_elements, block_size)),
+    )
     _masked_fill_inplace_kernel[grid](
         inp,
         expand_mask,

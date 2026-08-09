@@ -34,13 +34,29 @@ import os
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra.cpu.tle_ops import sdot_gemv as _tle_sdot_gemv
-from triton.language.extra.cpu.tle_ops import (
-    sdot_gemv_fused_bf16 as _tle_sdot_gemv_fused_bf16,
-)
-from triton.language.extra.cpu.tle_ops import (
-    sdot_pack_weights as _tle_sdot_pack_weights,
-)
+
+# The SDOT helpers belong to the legacy optional TLE runtime.  Importing them
+# unconditionally used to make this entire module fail on stock/3.7
+# Triton-CPU, which also disabled the unrelated ordinary-Triton SVE2/i8mm
+# prefill kernel below.  Keep the compatibility M=1 path optional without
+# hiding the compiler-generated matrix path behind the same dependency.
+try:
+    from triton.language.extra.cpu.tle_ops import (
+        sdot_gemv as _tle_sdot_gemv,
+    )
+    from triton.language.extra.cpu.tle_ops import (
+        sdot_gemv_fused_bf16 as _tle_sdot_gemv_fused_bf16,
+    )
+    from triton.language.extra.cpu.tle_ops import (
+        sdot_pack_weights as _tle_sdot_pack_weights,
+    )
+
+    _TLE_SDOT_AVAILABLE = True
+except ImportError:
+    _tle_sdot_gemv = None
+    _tle_sdot_gemv_fused_bf16 = None
+    _tle_sdot_pack_weights = None
+    _TLE_SDOT_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -119,13 +135,31 @@ def _sdot_gemv_kernel(a_ptr, packed_ptr, c_ptr, K: tl.constexpr, N: tl.constexpr
 
 @triton.jit
 def _sdot_gemv_fused_bf16_kernel(
-    x_ptr, packed_ptr, ws_ptr, out_ptr, K: tl.constexpr, N: tl.constexpr
+    x_ptr,
+    packed_ptr,
+    ws_ptr,
+    out_ptr,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
-    _tle_sdot_gemv_fused_bf16(x_ptr, packed_ptr, ws_ptr, out_ptr, K, N)
+    n_start = tl.program_id(0) * BLOCK_N
+    _tle_sdot_gemv_fused_bf16(
+        x_ptr,
+        packed_ptr,
+        ws_ptr,
+        out_ptr,
+        K,
+        N,
+        n_start,
+        BLOCK_N,
+    )
 
 
 def _sdot_enabled():
-    return os.getenv("FLAGGEMS_ARM_SDOT", "1").lower() in ("1", "true", "on")
+    return _TLE_SDOT_AVAILABLE and os.getenv(
+        "FLAGGEMS_ARM_SDOT", "1"
+    ).lower() in ("1", "true", "on")
 
 
 def _get_sdot_packed_weight(b_rowmajor, K, N):
@@ -141,6 +175,21 @@ def _get_sdot_packed_weight(b_rowmajor, K, N):
     _sdot_pack_kernel[(1,)](b_rowmajor, packed, K=K, N=N)
     _SDOT_WEIGHT_CACHE[key] = (packed, b_rowmajor)  # hold ref to prevent GC
     return packed
+
+
+def _get_sdot_blocked_weight(b_rowmajor, K, N, block_n):
+    key = ("blocked", b_rowmajor.data_ptr(), K, N, block_n)
+    if key in _SDOT_WEIGHT_CACHE:
+        return _SDOT_WEIGHT_CACHE[key][0]
+    packed = _get_sdot_packed_weight(b_rowmajor, K, N)
+    groups = block_n // 4
+    blocked = (
+        packed.reshape(K // 4, N // block_n, groups, 4, 4)
+        .permute(1, 0, 2, 3, 4)
+        .contiguous()
+    )
+    _SDOT_WEIGHT_CACHE[key] = (blocked, b_rowmajor)
+    return blocked
 
 
 def launch_sdot_fused_bf16(x_bf16, b_rowmajor, w_scale, K, N):
@@ -161,9 +210,23 @@ def launch_sdot_fused_bf16(x_bf16, b_rowmajor, w_scale, K, N):
     if K % 4 != 0 or N % 4 != 0:
         return None
     try:
-        packed = _get_sdot_packed_weight(b_rowmajor, K, N)
+        block_n = next(
+            candidate for candidate in (64, 32, 16, 4)
+            if N % candidate == 0
+        )
+        packed = _get_sdot_blocked_weight(
+            b_rowmajor, K, N, block_n
+        )
         out = torch.empty(N, dtype=torch.bfloat16)
-        _sdot_gemv_fused_bf16_kernel[(1,)](x_bf16, packed, w_scale, out, K=K, N=N)
+        _sdot_gemv_fused_bf16_kernel[(N // block_n,)](
+            x_bf16,
+            packed,
+            w_scale,
+            out,
+            K=K,
+            N=N,
+            BLOCK_N=block_n,
+        )
         _SDOT_TLE_OK = True
         return out
     except Exception:

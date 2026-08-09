@@ -1,6 +1,5 @@
 import builtins
 import logging
-import math
 
 import torch
 import triton
@@ -9,6 +8,8 @@ import triton.language as tl
 from flag_gems import runtime
 from flag_gems.utils import dim_compress
 from flag_gems.utils import triton_lang_extension as tle
+
+from ..vector_config import ELEMENTWISE_ROLLED_TILE
 
 # torch.all: Tests if all elements in input evaluate to True. If the dtype of input
 #            is not BOOL, then test if all elements in input evaluate to non-zero value
@@ -80,20 +81,37 @@ def all_kernel_2(mid, out, MID_SIZE, BLOCK_MID: tl.constexpr):
     tl.store(out, all_val)
 
 
+@triton.jit(do_not_specialize=["n_elements"])
+def all_rolled_kernel(inp, out, n_elements, BLOCK_SIZE: tl.constexpr):
+    lanes = tl.arange(0, BLOCK_SIZE)
+    state = 1
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for base in range(0, full_elements, BLOCK_SIZE):
+        tile = (tl.load(inp + base + lanes) != 0).to(tl.int32)
+        state &= tl.min(tile, axis=0)
+    if full_elements < n_elements:
+        idx = full_elements + lanes
+        mask = idx < n_elements
+        tile = (tl.load(inp + idx, mask=mask, other=1) != 0).to(tl.int32)
+        state &= tl.min(tile, axis=0)
+    tl.store(out, state != 0)
+
+
 def all(inp):
     logging.debug("GEMS ALL")
     n_elements = inp.numel()
-    block_size = triton.next_power_of_2(math.ceil(math.sqrt(n_elements)))
-    mid_size = triton.cdiv(n_elements, block_size)
-    block_mid = triton.next_power_of_2(mid_size)
-
-    mid = torch.empty((mid_size,), dtype=torch.bool, device=inp.device)
     out = torch.empty([], dtype=torch.bool, device=inp.device)
-
-    # with torch_device_fn.device(inp.device):
-    all_kernel_1[(mid_size, 1)](inp, mid, n_elements, mid_size, block_size)
-    all_kernel_2[(1, 1)](mid, out, mid_size, block_mid)
-
+    if n_elements == 0:
+        out.fill_(True)
+        return out
+    all_rolled_kernel[(1,)](
+        inp.contiguous().reshape(-1),
+        out,
+        n_elements,
+        BLOCK_SIZE=ELEMENTWISE_ROLLED_TILE,
+        num_warps=1,
+        num_stages=1,
+    )
     return out
 
 

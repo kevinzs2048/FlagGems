@@ -7,6 +7,8 @@ import triton.language as tl
 
 from flag_gems.ops import div as base_div
 
+from ..vector_config import ELEMENTWISE_ROLLED_TILE, SINGLE_PROGRAM_MAX_ELEMENTS
+
 
 @triton.jit
 def _div_tensor_scalar_kernel(
@@ -20,12 +22,17 @@ def _div_tensor_scalar_kernel(
     num_prog = tl.num_programs(0)
     start = pid * BLOCK_SIZE
     step = num_prog * BLOCK_SIZE
-    for off in range(start, n_elements, step):
-        offsets = off + tl.arange(0, BLOCK_SIZE)
+    lanes = tl.arange(0, BLOCK_SIZE)
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for off in range(start, full_elements, step):
+        offsets = off + lanes
+        x = tl.load(x_ptr + offsets)
+        tl.store(out_ptr + offsets, x / scalar)
+    if pid == 0 and full_elements < n_elements:
+        offsets = full_elements + lanes
         mask = offsets < n_elements
         x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-        y = x / scalar
-        tl.store(out_ptr + offsets, y, mask=mask)
+        tl.store(out_ptr + offsets, x / scalar, mask=mask)
 
 
 def _select_block_size(n_elements, dtype):
@@ -57,10 +64,18 @@ def _div_tensor_scalar_triton(x, scalar, out=None):
         out.fill_(val)
         return out
 
-    block_size = _select_block_size(n_elements, x.dtype)
-    block_size = min(block_size, triton.next_power_of_2(max(n_elements, 1)))
-    num_blocks = triton.cdiv(n_elements, block_size)
-    grid = (num_blocks,)
+    block_size = min(
+        ELEMENTWISE_ROLLED_TILE,
+        triton.next_power_of_2(max(n_elements, 1)),
+    )
+    num_programs = (
+        1
+        if n_elements <= SINGLE_PROGRAM_MAX_ELEMENTS
+        else min(
+            max(1, torch.get_num_threads()), triton.cdiv(n_elements, block_size)
+        )
+    )
+    grid = (num_programs,)
     x_contig, out_contig, _ = _maybe_contiguous(x, out)
     if out_contig is None:
         out_contig = torch.empty_like(x_contig)

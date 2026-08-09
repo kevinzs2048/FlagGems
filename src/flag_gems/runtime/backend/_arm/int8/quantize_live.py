@@ -107,14 +107,11 @@ def quantize_and_replace_linears(
         del module
         n_replaced += 1
 
-    # Engage the aten::_int_mm CPU override so TLEInt8Linear prefill's
-    # torch._int_mm routes to the Triton SVE2 i8mm kernel instead of ATen's
-    # scalar fallback (~15x slower). Idempotent + process-global on the CPU
-    # dispatch key. Only _int_mm is needed here; mm/argmax overrides were
-    # measured to not help the INT8 decode path.
-    from ..ops import apply_arm_overrides
-
-    apply_arm_overrides(include=["_int_mm"])
+    # Do not install the process-global aten::_int_mm override here.  All
+    # supported model prefill shapes use TLEInt8Linear's packed KAI-layout
+    # ordinary-Triton path directly.  The generic row-major override wins for
+    # M>=8 but regresses M1/M2/M4 by 2.5-4.4x, so callers that own a restricted
+    # shape contract must opt into it explicitly through apply_arm_overrides.
 
     logger.info(
         "quantize_and_replace_linears: replaced %d Linears "

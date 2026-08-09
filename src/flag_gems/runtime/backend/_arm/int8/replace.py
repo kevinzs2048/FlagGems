@@ -85,11 +85,9 @@ def replace_linears_with_tle_int8(
         setattr(parent, parts[-1], TLEInt8Linear(w, s))
         n_replaced += 1
 
-    # Engage the aten::_int_mm CPU override so TLEInt8Linear prefill's
-    # torch._int_mm routes to the Triton SVE2 i8mm kernel (see quantize_live.py).
-    from ..ops import apply_arm_overrides
-
-    apply_arm_overrides(include=["_int_mm"])
+    # The model-owned KAI-layout prefill path does not need a global
+    # aten::_int_mm override.  Keep the generic override explicit because its
+    # row-major M1/M2/M4 specializations regress against current ATen.
 
     logger.info(
         "TLEInt8Linear: replaced %d Linear modules "

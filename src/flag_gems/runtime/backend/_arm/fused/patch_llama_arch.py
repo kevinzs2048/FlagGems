@@ -1,4 +1,4 @@
-"""Apply Qwen3-equivalent TLE patches to HF Llama models (e.g. MiniCPM5-0.9B).
+"""Apply Qwen3-equivalent ordinary-Triton patches to HF Llama models.
 
 Llama interfaces are nearly identical to Qwen3 for the three op-density patches:
 - apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)   — same sig
@@ -37,7 +37,7 @@ _LLAMA_MODULE = "transformers.models.llama.modeling_llama"
 
 
 def patch_llama_rope() -> int:
-    """Replace Llama apply_rotary_pos_emb with our TLE @triton.jit kernel."""
+    """Replace Llama RoPE with the ordinary ``@triton.jit`` kernel."""
     try:
         mod = __import__(_LLAMA_MODULE, fromlist=["apply_rotary_pos_emb"])
     except (ImportError, AttributeError):

@@ -18,10 +18,18 @@ import triton.language as tl
 
 from flag_gems.utils import triton_lang_extension as tle
 
+from .aot_rms_backend import create_aot_rms_backend
+from ..profile_range import profile_range
+from ..vector_config import REDUCTION_TILE
+
 logger = logging.getLogger(__name__)
 
-_TILE = 128
+# Keep the Triton tensor at the native FP32 SIMD width scale and let the
+# runtime ``for`` carry it across N.  Wider values (32+) become giant fixed
+# LLVM vectors on triton-cpu and cause code-size growth and register spills.
+_TILE = REDUCTION_TILE
 _PATCHED: dict = {}
+_AOT_BACKENDS: dict[tuple[int, int, float], object | None] = {}
 
 
 @triton.jit(do_not_specialize=["eps"])
@@ -83,17 +91,26 @@ def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor
     M = x.numel() // N
     x_2d = x.reshape(M, N).contiguous()
     out = torch.empty_like(x_2d)
-    _rms_norm_kernel[(M,)](
-        x_2d,
-        weight,
-        out,
-        N,  # stride_r
-        N,
-        eps,
-        BLOCK_SIZE=_TILE,
-        num_warps=1,
-        num_stages=1,
-    )
+    aot_key = (M, N, eps)
+    if aot_key not in _AOT_BACKENDS:
+        _AOT_BACKENDS[aot_key] = create_aot_rms_backend(M, N, eps)
+    aot = _AOT_BACKENDS[aot_key]
+    if aot is not None:
+        with profile_range("triton::rms_norm_ordinary_aot"):
+            aot(x_2d, weight, out)
+        return out.reshape(x.shape)
+    with profile_range("triton::rms_norm"):
+        _rms_norm_kernel[(M,)](
+            x_2d,
+            weight,
+            out,
+            N,  # stride_r
+            N,
+            eps,
+            BLOCK_SIZE=_TILE,
+            num_warps=1,
+            num_stages=1,
+        )
     return out.reshape(x.shape)
 
 

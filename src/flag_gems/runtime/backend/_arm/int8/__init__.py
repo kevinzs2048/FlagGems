@@ -16,10 +16,12 @@ Usage:
 from .quantize_live import quantize_and_replace_linears  # noqa: F401
 from .replace import replace_linears_with_tle_int8  # noqa: F401
 from .tle_int8_linear import TLEInt8Linear, pack_weights_sdot  # noqa: F401
+from .optimize_qwen3 import optimize_qwen3_w8a8  # noqa: F401
 
 __all__ = [
     "TLEInt8Linear",
     "pack_weights_sdot",
     "replace_linears_with_tle_int8",
     "quantize_and_replace_linears",
+    "optimize_qwen3_w8a8",
 ]

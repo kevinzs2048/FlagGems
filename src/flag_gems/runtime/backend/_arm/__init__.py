@@ -410,6 +410,49 @@ CUSTOMIZED_UNUSED_OPS = (
     "to_copy",
     "mul_",
     "zeros_like",
+    # PR #3616/#3775 audit: these Arm implementations either regressed ATen
+    # in the measured decode shapes or did not finish compiling in a practical
+    # time.  Keep the source available for explicit experiments, but never
+    # install it as the default aten implementation.
+    "addmm",
+    "addmm_out",
+    "bmm",
+    "cumsum",
+    "exponential_",
+    "full",
+    "gather",
+    "index_select",
+    "isin",
+    "lt",
+    "min",
+    "multinomial",
+    "quantile",
+    "scatter",
+    "sort",
+    "topk",
+    # The rolled codegen kernels below win once the tensor is large enough to
+    # amortize CPU launcher/allocation cost (roughly 64K BF16 elements on the
+    # audited host), but regress 16-4096 element ATen calls by 3-52x.  The
+    # current FlagGems registrar has no non-recursive per-shape ATen fallback,
+    # so keep them explicit-call research paths instead of global overrides.
+    "all",
+    "any",
+    "div_mode",
+    "div_mode_",
+    "floor_divide",
+    "floor_divide_",
+    "masked_fill",
+    "pow_scalar",
+    "pow_tensor_scalar",
+    "pow_tensor_scalar_",
+    "pow_tensor_tensor",
+    "pow_tensor_tensor_",
+    "remainder",
+    "remainder_",
+    "sub",
+    "true_divide",
+    "true_divide_",
+    "where_self_out",
 )
 
 

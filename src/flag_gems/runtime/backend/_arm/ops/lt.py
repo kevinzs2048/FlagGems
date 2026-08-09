@@ -6,6 +6,8 @@ import triton.language as tl
 
 from flag_gems.utils import pointwise_dynamic
 
+from ..vector_config import ELEMENTWISE_ROLLED_TILE, SINGLE_PROGRAM_MAX_ELEMENTS
+
 
 @pointwise_dynamic(promotion_methods=[(0, 1, "ALWAYS_BOOL")])
 @triton.jit
@@ -22,25 +24,34 @@ def lt_kernel(
     BLOCK_SIZE: tl.constexpr = 16,
 ):
     pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    num_programs = tl.num_programs(0)
+    lanes = tl.arange(0, BLOCK_SIZE)
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for block_start in range(
+        pid * BLOCK_SIZE, full_elements, num_programs * BLOCK_SIZE
+    ):
+        offsets = block_start + lanes
+        x_vals = tl.load(x_ptr + offsets)
+        y_vals = tl.load(y_ptr + offsets)
+        tl.store(out_ptr + offsets, x_vals < y_vals)
 
-    mask = offsets < n_elements
-    x_vals = tl.load(x_ptr + offsets, mask=mask)
-    y_vals = tl.load(y_ptr + offsets, mask=mask)
-
-    out = x_vals < y_vals
-    tl.store(out_ptr + offsets, out, mask=mask)
+    # Keep the predicate out of the hot loop.  Generic masked loads currently
+    # lower to per-lane scalar guards in triton-cpu; only the final partial
+    # vector needs those semantics.
+    if pid == 0 and full_elements < n_elements:
+        offsets = full_elements + lanes
+        mask = offsets < n_elements
+        x_vals = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+        y_vals = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+        tl.store(out_ptr + offsets, x_vals < y_vals, mask=mask)
 
 
 def lt_block(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    # Ensure tensors are on same device and dtype
     assert x.device == y.device, "Tensors must be on the same device"
-    # device = x.device
-    dtype = torch.float32
-
-    # Broadcast tensors to the same shape
-    x_b, y_b = torch.broadcast_tensors(x.to(dtype), y.to(dtype))
+    # Do not cast BF16/FP16 tensors to a temporary FP32 tensor.  Triton/LLVM
+    # performs the comparison in the appropriate compute type and the direct
+    # loads keep this path bandwidth-bound like the ATen implementation.
+    x_b, y_b = torch.broadcast_tensors(x, y)
     out = torch.empty_like(x_b, dtype=torch.bool)
 
     # Flatten tensors for Triton kernel
@@ -50,9 +61,23 @@ def lt_block(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
     n_elements = out_flat.numel()
 
-    # Launch Triton kernel
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-    lt_kernel[grid](x_b_flat, y_b_flat, out_flat, n_elements, BLOCK_SIZE=16)
+    programs = (
+        1
+        if n_elements <= SINGLE_PROGRAM_MAX_ELEMENTS
+        else min(
+            max(1, torch.get_num_threads()),
+            triton.cdiv(n_elements, ELEMENTWISE_ROLLED_TILE),
+        )
+    )
+    lt_kernel[(programs,)](
+        x_b_flat,
+        y_b_flat,
+        out_flat,
+        n_elements,
+        BLOCK_SIZE=ELEMENTWISE_ROLLED_TILE,
+        num_warps=1,
+        num_stages=1,
+    )
 
     return out
 

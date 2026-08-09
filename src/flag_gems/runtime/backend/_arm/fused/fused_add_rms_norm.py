@@ -18,13 +18,20 @@ import triton.language as tl
 
 from flag_gems.utils import triton_lang_extension as tle
 
+from .aot_rms_backend import create_aot_fused_add_rms_backend
+from ..profile_range import profile_range
+from ..vector_config import REDUCTION_TILE
+
 logger = logging.getLogger(__name__)
 
 _PREWARM_DONE = False
 _PREWARM_ENABLED = os.environ.get("GEMS_ARM_FUSED_RMS_PREWARM", "1") == "1"
 
-# Use small block size to keep LLVM compilation fast (~seconds not minutes)
-_TILE_SIZE = 128
+# A rolled native-width tile is materially better than a wide fixed LLVM
+# vector on AArch64.  TILE=16 keeps both BF16 and promoted FP32 values in
+# registers; TILE>=32 currently triggers code expansion and spills.
+_TILE_SIZE = REDUCTION_TILE
+_AOT_BACKENDS: dict[tuple[int, int, float], object | None] = {}
 
 
 @triton.jit(do_not_specialize=["eps"])
@@ -57,12 +64,16 @@ def _fused_add_rms_norm_kernel(
         x = tl.load(in_row + cols, mask=mask, other=0.0).to(tl.float32)
         r = tl.load(r_row + cols, mask=mask, other=0.0).to(tl.float32)
 
-        x = x + r
+        # The unfused graph materializes ``residual + input`` as BF16 before
+        # RMSNorm consumes it.  Accumulating the square of the unrounded FP32
+        # sum changes the variance and can eventually alter greedy decoding.
+        x = (x + r).to(residual_ptr.dtype.element_ty)
 
         # Store updated residual
-        tl.store(r_row + cols, x.to(residual_ptr.dtype.element_ty), mask=mask)
+        tl.store(r_row + cols, x, mask=mask)
 
-        sum_sq += tl.sum(x * x, axis=0)
+        x_fp32 = x.to(tl.float32)
+        sum_sq += tl.sum(x_fp32 * x_fp32, axis=0)
 
     # Compute rrms
     var = sum_sq / N
@@ -135,18 +146,31 @@ def fused_add_rms_norm(x, residual, normalized_shape, weight, eps=1e-5):
     residual = residual.contiguous()
     weight = weight.contiguous()
 
-    _fused_add_rms_norm_kernel[(M,)](
-        x,
-        residual,
-        weight,
-        N,  # in_stride_r (contiguous: stride = N)
-        N,  # r_stride_r
-        N,
-        eps,
-        BLOCK_SIZE=_TILE_SIZE,
-        num_warps=1,
-        num_stages=1,
-    )
+    aot_key = (M, N, eps)
+    if x.dtype == torch.bfloat16:
+        if aot_key not in _AOT_BACKENDS:
+            _AOT_BACKENDS[aot_key] = create_aot_fused_add_rms_backend(
+                M, N, eps
+            )
+        aot = _AOT_BACKENDS[aot_key]
+        if aot is not None:
+            with profile_range("triton::fused_add_rms_norm_ordinary_aot"):
+                aot(x, residual, weight)
+            return x, residual
+
+    with profile_range("triton::fused_add_rms_norm"):
+        _fused_add_rms_norm_kernel[(M,)](
+            x,
+            residual,
+            weight,
+            N,  # in_stride_r (contiguous: stride = N)
+            N,  # r_stride_r
+            N,
+            eps,
+            BLOCK_SIZE=_TILE_SIZE,
+            num_warps=1,
+            num_stages=1,
+        )
     return x, residual
 
 

@@ -189,8 +189,9 @@ def _register_mm():
 
 
 def _register_sdpa():
-    # Triton-CPU Flash Attention for F.scaled_dot_product_attention (prefill 4-5x;
-    # decode/other cases fall back to ATen).
+    # Triton-CPU Flash Attention for F.scaled_dot_product_attention (prefill
+    # 4-5x); M=1 long-context decode uses staged BFDOT ordinary-Triton codegen
+    # and unsupported cases fall back to ATen.
     #
     # Intentionally a monkey-patch, NOT torch.library: a Library("aten","IMPL")
     # override would route the ATen fallback inside our own wrapper back to us
@@ -220,6 +221,21 @@ _ARM_OVERRIDE_REGISTRY = {
     "scaled_dot_product_attention": _register_sdpa,
 }
 
+# Only net-positive, shape-routed overrides are installed by the no-argument
+# convenience call.  Global aten::argmax and aten::mm interception is too broad
+# for decode-only wins.  The Q8 overrides also require an aligned packed-weight
+# contract that a global aten/quantized namespace hook cannot assume.  Model-
+# owned replacement code can still select these entries explicitly after it
+# validates shapes and packing.  SiLU-and-mul is useful only when fused into a
+# larger AOT/codegen region.
+_ARM_DEFAULT_OVERRIDES = set(_ARM_OVERRIDE_REGISTRY) - {
+    "_int_mm",
+    "argmax",
+    "mm",
+    "quantized_linear_dynamic",
+    "silu_and_mul",
+}
+
 _ARM_OVERRIDES_APPLIED = set()
 
 
@@ -227,14 +243,14 @@ def apply_arm_overrides(include=None, exclude=None):
     """Apply ARM CPU op overrides, optionally restricted to a subset.
 
     Args:
-        include: iterable of override names to apply (None = all known).
+        include: iterable of override names to apply (None = audited defaults).
         exclude: iterable of override names to skip (applied after include).
 
     Idempotent: each override is applied at most once per process. Names are the
     keys of _ARM_OVERRIDE_REGISTRY (the aten/flag_gems op each one overrides).
     """
     names = (
-        set(_ARM_OVERRIDE_REGISTRY)
+        set(_ARM_DEFAULT_OVERRIDES)
         if include is None
         else set(include) & set(_ARM_OVERRIDE_REGISTRY)
     )

@@ -13,6 +13,8 @@ from flag_gems import runtime
 # from ..utils import libentry
 from flag_gems.utils import triton_lang_extension as tle
 
+from ..vector_config import REDUCTION_TILE
+
 
 # @libentry()
 @triton.jit
@@ -41,6 +43,31 @@ def min_kernel_2(mid, out, mid_size, BLOCK_MID: tl.constexpr):
     mid_val = tl.load(mid_ptrs, mask=mask, other=float("inf"))
     min_val = tl.min(mid_val)
     tl.store(out, min_val)
+
+
+@triton.jit(do_not_specialize=["n_elements"])
+def min_rolled_kernel(inp, out, n_elements, BLOCK_SIZE: tl.constexpr):
+    lanes = tl.arange(0, BLOCK_SIZE)
+    best = tl.full((BLOCK_SIZE,), float("inf"), tl.float32)
+    saw_nan = tl.full((BLOCK_SIZE,), False, tl.int1)
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for base in range(0, full_elements, BLOCK_SIZE):
+        values = tl.load(inp + base + lanes).to(tl.float32)
+        is_nan = values != values
+        saw_nan |= is_nan
+        best = tl.minimum(best, tl.where(is_nan, float("inf"), values))
+    if full_elements < n_elements:
+        idx = full_elements + lanes
+        mask = idx < n_elements
+        values = tl.load(inp + idx, mask=mask, other=float("inf")).to(
+            tl.float32
+        )
+        is_nan = values != values
+        saw_nan |= is_nan
+        best = tl.minimum(best, tl.where(is_nan, float("inf"), values))
+    result = tl.min(best, axis=0)
+    result = tl.where(tl.max(saw_nan.to(tl.int32), axis=0) != 0, float("nan"), result)
+    tl.store(out, result)
 
 
 @triton.autotune(
@@ -118,6 +145,21 @@ def min_kernel(
 def min(inp):
     logging.debug("GEMS MIN")
     M = inp.numel()
+    if M == 0:
+        raise RuntimeError(
+            "min(): Expected reduction dim to be specified for input.numel() == 0"
+        )
+    if inp.dtype in (torch.float16, torch.bfloat16, torch.float32):
+        out = torch.empty([], dtype=inp.dtype, device=inp.device)
+        min_rolled_kernel[(1,)](
+            inp.contiguous().reshape(-1),
+            out,
+            M,
+            BLOCK_SIZE=REDUCTION_TILE,
+            num_warps=1,
+            num_stages=1,
+        )
+        return out
     block_size = triton.next_power_of_2(math.ceil(math.sqrt(M)))
     mid_size = triton.cdiv(M, block_size)
     block_mid = triton.next_power_of_2(mid_size)

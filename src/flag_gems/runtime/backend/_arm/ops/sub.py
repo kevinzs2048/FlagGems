@@ -7,6 +7,8 @@ import triton.language as tl
 
 from flag_gems.utils import pointwise_dynamic
 
+from ..vector_config import ELEMENTWISE_ROLLED_TILE, SINGLE_PROGRAM_MAX_ELEMENTS
+
 logger = logging.getLogger(__name__)
 _PREWARM_SUB_DONE = False
 
@@ -24,6 +26,16 @@ _SUPPORTED_INT_FAST_DTYPES = (
 )
 
 
+@triton.jit
+def _round_scaled_operand(value, tensor_ptr):
+    """Match ATen's visible low-precision rounding of ``operand * alpha``."""
+    if tensor_ptr.dtype.element_ty == tl.bfloat16:
+        return value.to(tl.bfloat16).to(tl.float32)
+    if tensor_ptr.dtype.element_ty == tl.float16:
+        return value.to(tl.float16).to(tl.float32)
+    return value
+
+
 @triton.jit(do_not_specialize=["alpha", "n_elements"])
 def _sub_contiguous_kernel(
     x_ptr,
@@ -34,11 +46,24 @@ def _sub_contiguous_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
-    tl.store(out_ptr + offsets, x - y * alpha, mask=mask)
+    num_programs = tl.num_programs(0)
+    lanes = tl.arange(0, BLOCK_SIZE)
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for base in range(
+        pid * BLOCK_SIZE, full_elements, num_programs * BLOCK_SIZE
+    ):
+        idx = base + lanes
+        x = tl.load(x_ptr + idx)
+        y = tl.load(y_ptr + idx)
+        scaled = _round_scaled_operand(y * alpha, y_ptr)
+        tl.store(out_ptr + idx, x - scaled)
+    if pid == 0 and full_elements < n_elements:
+        idx = full_elements + lanes
+        mask = idx < n_elements
+        x = tl.load(x_ptr + idx, mask=mask, other=0.0)
+        y = tl.load(y_ptr + idx, mask=mask, other=0.0)
+        scaled = _round_scaled_operand(y * alpha, y_ptr)
+        tl.store(out_ptr + idx, x - scaled, mask=mask)
 
 
 @triton.jit(do_not_specialize=["alpha", "n_elements"])
@@ -51,12 +76,20 @@ def _sub_contiguous_single_program_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     offs = tl.arange(0, BLOCK_SIZE)
-    for base in range(0, n_elements, BLOCK_SIZE):
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for base in range(0, full_elements, BLOCK_SIZE):
         idx = base + offs
+        x = tl.load(x_ptr + idx)
+        y = tl.load(y_ptr + idx)
+        scaled = _round_scaled_operand(y * alpha, y_ptr)
+        tl.store(out_ptr + idx, x - scaled)
+    if full_elements < n_elements:
+        idx = full_elements + offs
         mask = idx < n_elements
         x = tl.load(x_ptr + idx, mask=mask, other=0.0)
         y = tl.load(y_ptr + idx, mask=mask, other=0.0)
-        tl.store(out_ptr + idx, x - y * alpha, mask=mask)
+        scaled = _round_scaled_operand(y * alpha, y_ptr)
+        tl.store(out_ptr + idx, x - scaled, mask=mask)
 
 
 @triton.jit(do_not_specialize=["alpha", "rows", "cols"])
@@ -80,7 +113,8 @@ def _sub_broadcast_lastdim1_kernel(
         col = base + offs
         mask = col < cols
         x = tl.load(x_ptr + row_start + col, mask=mask, other=0.0)
-        tl.store(out_ptr + row_start + col, x - y * alpha, mask=mask)
+        scaled = _round_scaled_operand(y * alpha, y_ptr)
+        tl.store(out_ptr + row_start + col, x - scaled, mask=mask)
 
 
 @triton.jit(do_not_specialize=["scalar", "alpha", "n_elements"])
@@ -93,10 +127,22 @@ def _sub_tensor_scalar_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    tl.store(out_ptr + offsets, x - scalar * alpha, mask=mask)
+    num_programs = tl.num_programs(0)
+    lanes = tl.arange(0, BLOCK_SIZE)
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for base in range(
+        pid * BLOCK_SIZE, full_elements, num_programs * BLOCK_SIZE
+    ):
+        idx = base + lanes
+        x = tl.load(x_ptr + idx)
+        scaled = _round_scaled_operand(scalar * alpha, x_ptr)
+        tl.store(out_ptr + idx, x - scaled)
+    if pid == 0 and full_elements < n_elements:
+        idx = full_elements + lanes
+        mask = idx < n_elements
+        x = tl.load(x_ptr + idx, mask=mask, other=0.0)
+        scaled = _round_scaled_operand(scalar * alpha, x_ptr)
+        tl.store(out_ptr + idx, x - scaled, mask=mask)
 
 
 @triton.jit(do_not_specialize=["scalar", "alpha", "n_elements"])
@@ -109,11 +155,18 @@ def _sub_tensor_scalar_single_program_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     offs = tl.arange(0, BLOCK_SIZE)
-    for base in range(0, n_elements, BLOCK_SIZE):
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for base in range(0, full_elements, BLOCK_SIZE):
         idx = base + offs
+        x = tl.load(x_ptr + idx)
+        scaled = _round_scaled_operand(scalar * alpha, x_ptr)
+        tl.store(out_ptr + idx, x - scaled)
+    if full_elements < n_elements:
+        idx = full_elements + offs
         mask = idx < n_elements
         x = tl.load(x_ptr + idx, mask=mask, other=0.0)
-        tl.store(out_ptr + idx, x - scalar * alpha, mask=mask)
+        scaled = _round_scaled_operand(scalar * alpha, x_ptr)
+        tl.store(out_ptr + idx, x - scaled, mask=mask)
 
 
 @triton.jit(do_not_specialize=["scalar", "n_elements"])
@@ -125,10 +178,19 @@ def _sub_tensor_scalar_int_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    x = tl.load(x_ptr + offsets, mask=mask, other=0)
-    tl.store(out_ptr + offsets, x - scalar, mask=mask)
+    num_programs = tl.num_programs(0)
+    lanes = tl.arange(0, BLOCK_SIZE)
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for base in range(
+        pid * BLOCK_SIZE, full_elements, num_programs * BLOCK_SIZE
+    ):
+        idx = base + lanes
+        tl.store(out_ptr + idx, tl.load(x_ptr + idx) - scalar)
+    if pid == 0 and full_elements < n_elements:
+        idx = full_elements + lanes
+        mask = idx < n_elements
+        x = tl.load(x_ptr + idx, mask=mask, other=0)
+        tl.store(out_ptr + idx, x - scalar, mask=mask)
 
 
 @triton.jit(do_not_specialize=["scalar", "n_elements"])
@@ -140,8 +202,13 @@ def _sub_tensor_scalar_int_single_program_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     offs = tl.arange(0, BLOCK_SIZE)
-    for base in range(0, n_elements, BLOCK_SIZE):
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for base in range(0, full_elements, BLOCK_SIZE):
         idx = base + offs
+        x = tl.load(x_ptr + idx)
+        tl.store(out_ptr + idx, x - scalar)
+    if full_elements < n_elements:
+        idx = full_elements + offs
         mask = idx < n_elements
         x = tl.load(x_ptr + idx, mask=mask, other=0)
         tl.store(out_ptr + idx, x - scalar, mask=mask)
@@ -157,10 +224,22 @@ def _sub_scalar_tensor_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
-    tl.store(out_ptr + offsets, scalar - y * alpha, mask=mask)
+    num_programs = tl.num_programs(0)
+    lanes = tl.arange(0, BLOCK_SIZE)
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for base in range(
+        pid * BLOCK_SIZE, full_elements, num_programs * BLOCK_SIZE
+    ):
+        idx = base + lanes
+        y = tl.load(y_ptr + idx)
+        scaled = _round_scaled_operand(y * alpha, y_ptr)
+        tl.store(out_ptr + idx, scalar - scaled)
+    if pid == 0 and full_elements < n_elements:
+        idx = full_elements + lanes
+        mask = idx < n_elements
+        y = tl.load(y_ptr + idx, mask=mask, other=0.0)
+        scaled = _round_scaled_operand(y * alpha, y_ptr)
+        tl.store(out_ptr + idx, scalar - scaled, mask=mask)
 
 
 @triton.jit(do_not_specialize=["scalar", "alpha", "n_elements"])
@@ -173,11 +252,18 @@ def _sub_scalar_tensor_single_program_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     offs = tl.arange(0, BLOCK_SIZE)
-    for base in range(0, n_elements, BLOCK_SIZE):
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for base in range(0, full_elements, BLOCK_SIZE):
         idx = base + offs
+        y = tl.load(y_ptr + idx)
+        scaled = _round_scaled_operand(y * alpha, y_ptr)
+        tl.store(out_ptr + idx, scalar - scaled)
+    if full_elements < n_elements:
+        idx = full_elements + offs
         mask = idx < n_elements
         y = tl.load(y_ptr + idx, mask=mask, other=0.0)
-        tl.store(out_ptr + idx, scalar - y * alpha, mask=mask)
+        scaled = _round_scaled_operand(y * alpha, y_ptr)
+        tl.store(out_ptr + idx, scalar - scaled, mask=mask)
 
 
 @triton.jit(do_not_specialize=["scalar", "n_elements"])
@@ -189,10 +275,19 @@ def _sub_scalar_tensor_int_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    y = tl.load(y_ptr + offsets, mask=mask, other=0)
-    tl.store(out_ptr + offsets, scalar - y, mask=mask)
+    num_programs = tl.num_programs(0)
+    lanes = tl.arange(0, BLOCK_SIZE)
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for base in range(
+        pid * BLOCK_SIZE, full_elements, num_programs * BLOCK_SIZE
+    ):
+        idx = base + lanes
+        tl.store(out_ptr + idx, scalar - tl.load(y_ptr + idx))
+    if pid == 0 and full_elements < n_elements:
+        idx = full_elements + lanes
+        mask = idx < n_elements
+        y = tl.load(y_ptr + idx, mask=mask, other=0)
+        tl.store(out_ptr + idx, scalar - y, mask=mask)
 
 
 @triton.jit(do_not_specialize=["scalar", "n_elements"])
@@ -204,8 +299,13 @@ def _sub_scalar_tensor_int_single_program_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     offs = tl.arange(0, BLOCK_SIZE)
-    for base in range(0, n_elements, BLOCK_SIZE):
+    full_elements = (n_elements // BLOCK_SIZE) * BLOCK_SIZE
+    for base in range(0, full_elements, BLOCK_SIZE):
         idx = base + offs
+        y = tl.load(y_ptr + idx)
+        tl.store(out_ptr + idx, scalar - y)
+    if full_elements < n_elements:
+        idx = full_elements + offs
         mask = idx < n_elements
         y = tl.load(y_ptr + idx, mask=mask, other=0)
         tl.store(out_ptr + idx, scalar - y, mask=mask)
@@ -244,15 +344,17 @@ def _select_block_size(n_elements, dtype):
 
 
 def _single_program_block(n_elements):
-    if n_elements <= 256:
-        return 32
-    if n_elements <= 2048:
-        return 128
-    return 256
+    return min(
+        ELEMENTWISE_ROLLED_TILE,
+        triton.next_power_of_2(max(n_elements, 1)),
+    )
 
 
 def _launch_sub_tensor_tensor(x, y, out, alpha, n_elements, block_size):
-    if 1 < n_elements <= 8192:
+    if 1 < n_elements and (
+        torch.get_num_threads() == 1
+        or n_elements <= SINGLE_PROGRAM_MAX_ELEMENTS
+    ):
         single_block = _single_program_block(n_elements)
         _sub_contiguous_single_program_kernel[(1,)](
             x,
@@ -266,7 +368,10 @@ def _launch_sub_tensor_tensor(x, y, out, alpha, n_elements, block_size):
         )
         return
 
-    grid = (triton.cdiv(n_elements, block_size),)
+    block_size = _single_program_block(n_elements)
+    grid = (
+        min(torch.get_num_threads(), triton.cdiv(n_elements, block_size)),
+    )
     _sub_contiguous_kernel[grid](
         x,
         y,
@@ -280,7 +385,10 @@ def _launch_sub_tensor_tensor(x, y, out, alpha, n_elements, block_size):
 
 
 def _launch_sub_tensor_scalar(x, scalar, out, alpha, n_elements, block_size):
-    if 1 < n_elements <= 8192:
+    if 1 < n_elements and (
+        torch.get_num_threads() == 1
+        or n_elements <= SINGLE_PROGRAM_MAX_ELEMENTS
+    ):
         single_block = _single_program_block(n_elements)
         _sub_tensor_scalar_single_program_kernel[(1,)](
             x,
@@ -294,7 +402,10 @@ def _launch_sub_tensor_scalar(x, scalar, out, alpha, n_elements, block_size):
         )
         return
 
-    grid = (triton.cdiv(n_elements, block_size),)
+    block_size = _single_program_block(n_elements)
+    grid = (
+        min(torch.get_num_threads(), triton.cdiv(n_elements, block_size)),
+    )
     _sub_tensor_scalar_kernel[grid](
         x,
         scalar,
@@ -308,7 +419,10 @@ def _launch_sub_tensor_scalar(x, scalar, out, alpha, n_elements, block_size):
 
 
 def _launch_sub_tensor_scalar_int(x, scalar, out, n_elements, block_size):
-    if 1 < n_elements <= 8192:
+    if 1 < n_elements and (
+        torch.get_num_threads() == 1
+        or n_elements <= SINGLE_PROGRAM_MAX_ELEMENTS
+    ):
         single_block = _single_program_block(n_elements)
         _sub_tensor_scalar_int_single_program_kernel[(1,)](
             x,
@@ -321,7 +435,10 @@ def _launch_sub_tensor_scalar_int(x, scalar, out, n_elements, block_size):
         )
         return
 
-    grid = (triton.cdiv(n_elements, block_size),)
+    block_size = _single_program_block(n_elements)
+    grid = (
+        min(torch.get_num_threads(), triton.cdiv(n_elements, block_size)),
+    )
     _sub_tensor_scalar_int_kernel[grid](
         x,
         scalar,
@@ -359,7 +476,10 @@ def _launch_sub_broadcast_lastdim1(x, y, out, alpha):
 
 
 def _launch_sub_scalar_tensor(scalar, y, out, alpha, n_elements, block_size):
-    if 1 < n_elements <= 8192:
+    if 1 < n_elements and (
+        torch.get_num_threads() == 1
+        or n_elements <= SINGLE_PROGRAM_MAX_ELEMENTS
+    ):
         single_block = _single_program_block(n_elements)
         _sub_scalar_tensor_single_program_kernel[(1,)](
             scalar,
@@ -373,7 +493,10 @@ def _launch_sub_scalar_tensor(scalar, y, out, alpha, n_elements, block_size):
         )
         return
 
-    grid = (triton.cdiv(n_elements, block_size),)
+    block_size = _single_program_block(n_elements)
+    grid = (
+        min(torch.get_num_threads(), triton.cdiv(n_elements, block_size)),
+    )
     _sub_scalar_tensor_kernel[grid](
         scalar,
         y,
@@ -387,7 +510,10 @@ def _launch_sub_scalar_tensor(scalar, y, out, alpha, n_elements, block_size):
 
 
 def _launch_sub_scalar_tensor_int(scalar, y, out, n_elements, block_size):
-    if 1 < n_elements <= 8192:
+    if 1 < n_elements and (
+        torch.get_num_threads() == 1
+        or n_elements <= SINGLE_PROGRAM_MAX_ELEMENTS
+    ):
         single_block = _single_program_block(n_elements)
         _sub_scalar_tensor_int_single_program_kernel[(1,)](
             scalar,
@@ -400,7 +526,10 @@ def _launch_sub_scalar_tensor_int(scalar, y, out, n_elements, block_size):
         )
         return
 
-    grid = (triton.cdiv(n_elements, block_size),)
+    block_size = _single_program_block(n_elements)
+    grid = (
+        min(torch.get_num_threads(), triton.cdiv(n_elements, block_size)),
+    )
     _sub_scalar_tensor_int_kernel[grid](
         scalar,
         y,
