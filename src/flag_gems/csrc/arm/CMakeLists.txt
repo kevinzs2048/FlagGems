@@ -37,6 +37,7 @@ function(flag_gems_relocate_openmp target)
   endif()
 endfunction()
 
+set(_flag_gems_triton_jit_target triton_jit)
 if(NOT TARGET triton_jit)
   if(NOT DEFINED TRITON_JIT_ROOT OR NOT DEFINED TRITON_JIT_BUILD)
     message(FATAL_ERROR
@@ -46,11 +47,12 @@ if(NOT TARGET triton_jit)
   set(fmt_DIR "${TRITON_JIT_BUILD}/_deps/fmt-build")
   find_package(TritonJIT CONFIG REQUIRED
     PATHS "${TRITON_JIT_BUILD}" NO_DEFAULT_PATH)
+  set(_flag_gems_triton_jit_target TritonJIT::triton_jit)
 endif()
 
 add_library(flag_gems_arm_ops SHARED q4_op.cpp w8_op.cpp gdn_op.cpp)
 target_link_libraries(flag_gems_arm_ops PRIVATE
-  Torch::Torch triton_jit OpenMP::OpenMP_CXX ffi)
+  Torch::Torch ${_flag_gems_triton_jit_target} OpenMP::OpenMP_CXX ffi)
 target_compile_definitions(flag_gems_arm_ops PRIVATE
   FLAGGEMS_Q4_KERNEL_SOURCE_DEFAULT=""
   FLAGGEMS_W8_KERNEL_SOURCE_DEFAULT="")
