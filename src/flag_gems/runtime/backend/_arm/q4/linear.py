@@ -1,9 +1,9 @@
 """Production Q4A8 linear router for Arm Triton-CPU.
 
 The prefill route uses ordinary Triton for both activation quantization and
-the Q4 matrix multiply. Decode (M < 4) uses a dedicated ordinary-Triton SDOT
-kernel because four-row I8MM is not an efficient one-row kernel. Neither route
-calls a TLE/runtime matrix implementation.
+the portable Q4 matrix multiply. Decode (M < 4) remains a dedicated
+ordinary-Triton SDOT kernel because four-row I8MM is not an efficient one-row
+kernel. No route calls a TLE/runtime matrix implementation.
 """
 
 from __future__ import annotations
@@ -58,6 +58,9 @@ _FUSED_G128_DECODE_OVERRIDE = os.getenv(
 _USE_COMPACT_G128_NORM = os.getenv(
     "FLAGGEMS_ARM_Q4_COMPACT_G128_NORM", "0"
 ).lower() in {"1", "true", "on"}
+_USE_VLLM_FAST_APPLY = os.getenv(
+    "FLAGGEMS_Q4_FAST_APPLY", "0"
+).lower() in {"1", "true", "on"}
 _STATS = {
     "prepared_linears": 0,
     "prepared_g128_linears": 0,
@@ -95,6 +98,14 @@ def set_fused_decode_enabled(enabled: bool) -> bool:
     global _USE_FUSED_DECODE
     previous = _USE_FUSED_DECODE
     _USE_FUSED_DECODE = bool(enabled)
+    return previous
+
+
+def set_vllm_fast_apply_enabled(enabled: bool) -> bool:
+    """Toggle the cached prepared-layer Q4 call path for same-engine A/B."""
+    global _USE_VLLM_FAST_APPLY
+    previous = _USE_VLLM_FAST_APPLY
+    _USE_VLLM_FAST_APPLY = bool(enabled)
     return previous
 
 
@@ -211,6 +222,64 @@ def pack_rhs_qsi4c32p_asym(
         scaled_sums.reshape(n // 4, 4, groups)
         .permute(0, 2, 1)
         .contiguous()
+    )
+    return rhs.reshape(-1).contiguous()
+
+
+def pack_rhs_qsi4c32p_asym_compact(
+    quantized: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    """Pack G32 Q4 with one scale-weighted correction per N4 tile.
+
+    Each K32 record keeps four BF16 scales and 64 bytes of signed nibbles.
+    The zero-point correction is linear across K, so a single FP32 vector at
+    the end of the output tile replaces the INT16 vector formerly repeated in
+    every 80-byte K32 record.
+    """
+    if quantized.dtype != torch.int8 or quantized.ndim != 2:
+        raise ValueError("quantized weight must be an INT8 [N,K] tensor")
+    n, k = quantized.shape
+    groups = k // BLOCK_LENGTH
+    if n <= 0 or k <= 0 or n % 4 or k % BLOCK_LENGTH:
+        raise ValueError("invalid compact asymmetric Q4 tensor shape")
+    if scale.shape != (n, groups) or not scale.is_floating_point():
+        raise ValueError("invalid compact asymmetric Q4 scale shape or dtype")
+    if quantized.device.type != "cpu" or scale.device != quantized.device:
+        raise ValueError("compact asymmetric Q4 packing supports CPU tensors")
+    if not torch.isfinite(scale).all():
+        raise ValueError("compact asymmetric Q4 scales must be finite")
+    if int(quantized.min()) < -8 or int(quantized.max()) > 7:
+        raise ValueError("Q4 values must be in [-8,7]")
+
+    tile_stride = groups * 72 + 16
+    rhs = torch.empty(
+        (n // 4, tile_stride), dtype=torch.uint8, device=quantized.device
+    )
+    rhs_groups = rhs[:, : groups * 72].reshape(n // 4, groups, 72)
+    scale_bf16 = scale.to(torch.bfloat16)
+    rhs_groups[:, :, :8].view(torch.bfloat16).copy_(
+        scale_bf16
+        .reshape(n // 4, 4, groups)
+        .permute(0, 2, 1)
+        .contiguous()
+    )
+    grouped = quantized.reshape(n, groups, 32)
+    low = grouped[:, :, :16].reshape(n, groups, 2, 8).to(torch.int16) & 15
+    high = grouped[:, :, 16:].reshape(n, groups, 2, 8).to(torch.int16) & 15
+    data = (low | (high << 4)).to(torch.uint8)
+    rhs_groups[:, :, 8:].copy_(
+        data.reshape(n // 4, 4, groups, 2, 8)
+        .permute(0, 2, 3, 1, 4)
+        .contiguous()
+        .reshape(n // 4, groups, 64)
+    )
+
+    scaled_sums = grouped.to(torch.int16).sum(dim=-1) * 16
+    weighted_sums = (
+        scaled_sums.to(torch.float32) * scale_bf16.to(torch.float32)
+    ).sum(dim=1)
+    rhs[:, groups * 72 :].view(torch.float32).copy_(
+        weighted_sums.reshape(n // 4, 4)
     )
     return rhs.reshape(-1).contiguous()
 
@@ -2178,6 +2247,94 @@ def _make_vllm_w8_linear(
     return cpu_linear
 
 
+def _vllm_dynamic4bit_kernel(layer: torch.nn.Module):
+    """Resolve the MP kernel nested under vLLM's quantization scheme."""
+    scheme = getattr(layer, "scheme", None)
+    return getattr(scheme, "kernel", None)
+
+
+def prepare_vllm_q4_g32_pair(
+    first_layer: torch.nn.Module,
+    second_layer: torch.nn.Module,
+) -> object | None:
+    """Resolve two G32 projections once and return their decode hot path.
+
+    This is intentionally a narrow helper for the Qwen GDN qkvz/ba pair.  It
+    resolves vLLM's nested quantization objects and hybrid RHS slices once;
+    repeating that Python introspection in 48 layers per token erases the
+    small native-kernel saving.  The returned callable still rejects prefill.
+    """
+    if (
+        getattr(first_layer, "bias", None) is not None
+        or getattr(second_layer, "bias", None) is not None
+        or getattr(first_layer, "tp_size", 1) != 1
+        or getattr(second_layer, "tp_size", 1) != 1
+    ):
+        return None
+    first_kernel = _vllm_dynamic4bit_kernel(first_layer)
+    second_kernel = _vllm_dynamic4bit_kernel(second_layer)
+    if first_kernel is None or second_kernel is None:
+        return None
+    first_shape = getattr(
+        first_kernel, "_flag_gems_libtriton_jit_q4_shape", None
+    )
+    second_shape = getattr(
+        second_kernel, "_flag_gems_libtriton_jit_q4_shape", None
+    )
+    if first_shape is None or second_shape is None:
+        return None
+    n0, k0, group0 = first_shape
+    n1, k1, group1 = second_shape
+    if group0 != group1 or group0 not in {32, 128} or k0 != k1:
+        return None
+
+    if group0 == 32 and not hasattr(
+        torch.ops.triton_jit_cpu, "q4_linear_g32_asym_compact_pair"
+    ):
+        return None
+    if group0 == 128 and not hasattr(
+        torch.ops.triton_jit_cpu, "q4_linear_g128_pair"
+    ):
+        return None
+    if group0 == 128 and os.getenv(
+        "FLAGGEMS_Q4_FUSED_GDN_G128", "0"
+    ).lower() not in {"1", "true", "on"}:
+        return None
+
+    rhs0 = getattr(first_layer, first_kernel.w_q_name)
+    rhs1 = getattr(second_layer, second_kernel.w_q_name)
+    def apply(x: torch.Tensor) -> torch.Tensor | None:
+        if (
+            x.device.type != "cpu"
+            or x.shape[-1] != k0
+            or x.numel() != k0
+        ):
+            return None
+        source_dtype = x.dtype
+        x_bf16 = x if source_dtype == torch.bfloat16 else x.to(torch.bfloat16)
+        if group0 == 128:
+            output = torch.ops.triton_jit_cpu.q4_linear_g128_pair(
+                x_bf16.contiguous(), rhs0, n0, rhs1, n1, k0
+            )
+        else:
+            output = torch.ops.triton_jit_cpu.q4_linear_g32_asym_compact_pair(
+                x_bf16.contiguous(), rhs0, n0, rhs1, n1, k0
+            )
+        return output if source_dtype == torch.bfloat16 else output.to(source_dtype)
+
+    return apply
+
+
+def apply_vllm_q4_g32_pair(
+    first_layer: torch.nn.Module,
+    second_layer: torch.nn.Module,
+    x: torch.Tensor,
+) -> torch.Tensor | None:
+    """One-shot compatibility wrapper around the cached-pair preparation."""
+    apply = prepare_vllm_q4_g32_pair(first_layer, second_layer)
+    return None if apply is None else apply(x)
+
+
 def _enable_vllm_dynamic4bit_g128() -> None:
     """Route vLLM compressed-tensors G128 Q4 through libtriton_jit.
 
@@ -2191,6 +2348,7 @@ def _enable_vllm_dynamic4bit_g128() -> None:
         Dynamic4bitLinearKernel,
     )
     from vllm.model_executor.layers.quantization.utils import replace_parameter
+    from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP
 
     if getattr(
         Dynamic4bitLinearKernel,
@@ -2201,7 +2359,9 @@ def _enable_vllm_dynamic4bit_g128() -> None:
 
     original_process = Dynamic4bitLinearKernel.process_weights_after_loading
     original_apply = Dynamic4bitLinearKernel.apply_weights
-
+    from compressed_tensors.compressors.pack_quantized.helpers import (
+        unpack_from_int32,
+    )
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         config = self.config
         if config.group_size not in {32, 128} or config.zero_points:
@@ -2210,22 +2370,60 @@ def _enable_vllm_dynamic4bit_g128() -> None:
         quantized = getattr(layer, self.w_q_name)
         scales = getattr(layer, self.w_s_name)
         k, n = config.partition_weight_shape
+        packed_checkpoint = (
+            quantized.dtype == torch.int32
+            and quantized.shape == (n, k // 8)
+        )
+        if packed_checkpoint:
+            weight_shape = getattr(layer, "weight_shape", None)
+            if weight_shape is not None:
+                loaded_shape = tuple(int(v) for v in weight_shape.tolist())
+                # Stacked vLLM projections concatenate the packed q/k/v or
+                # gate/up tensors, while this two-element auxiliary parameter
+                # is overwritten by one component's original shape.  The
+                # packed tensor itself is authoritative for total N; the
+                # auxiliary shape can still catch a wrong K or impossible N.
+                if (
+                    len(loaded_shape) != 2
+                    or loaded_shape[1] != k
+                    or not 0 < loaded_shape[0] <= n
+                ):
+                    raise RuntimeError(
+                        "unexpected compressed-tensors packed-Q4 weight_shape: "
+                        f"loaded={loaded_shape}, fused_expected={(n, k)}"
+                    )
+            quantized_nk = unpack_from_int32(
+                quantized.detach(), 4, torch.Size((n, k))
+            ).contiguous()
+        else:
+            quantized_nk = quantized
         if (
-            quantized.dtype != torch.int8
-            or quantized.shape != (n, k)
+            quantized_nk.dtype != torch.int8
+            or quantized_nk.shape != (n, k)
             or scales.shape != (n, k // config.group_size)
         ):
             raise RuntimeError(
                 "unexpected vLLM compressed-tensors grouped-Q4 parameter shape"
             )
+        if os.getenv("FLAGGEMS_Q4_VLLM_NATIVE", "0").lower() in {
+            "1", "true", "on"
+        }:
+            if packed_checkpoint:
+                replace_parameter(
+                    layer,
+                    self.w_q_name,
+                    torch.nn.Parameter(quantized_nk, requires_grad=False),
+                )
+                setattr(layer, "weight_shape", None)
+            return original_process(self, layer)
         if config.group_size == 128:
             rhs = pack_rhs_qsi4c128p_asym(
-                quantized.detach().contiguous(),
+                quantized_nk,
                 scales.detach().to(torch.bfloat16).contiguous(),
             )
         else:
-            rhs = pack_rhs_qsi4c32p_asym(
-                quantized.detach().contiguous(),
+            rhs = pack_rhs_qsi4c32p_asym_compact(
+                quantized_nk,
                 scales.detach().to(torch.bfloat16).contiguous(),
             )
         replace_parameter(
@@ -2233,7 +2431,64 @@ def _enable_vllm_dynamic4bit_g128() -> None:
             self.w_q_name,
             torch.nn.Parameter(rhs, requires_grad=False),
         )
+        # CompressedTensorsW4A8Int registers the checkpoint tensor under both
+        # `weight` and `weight_packed`. Replacing only `weight_packed` leaves
+        # the full [N,K] INT8 source alias alive even though each value holds
+        # only one signed INT4 code. For Qwen3.6-27B that stale alias retains
+        # 22.68 GiB in addition to the 12.77 GiB compact runtime layout.
+        # Inference uses `weight_packed` through this kernel, so the `weight`
+        # alias can be released after packing. Keep this gated for exact/E2E
+        # validation before making it the production default.
+        release_source = os.getenv(
+            "FLAGGEMS_Q4_RELEASE_SOURCE_WEIGHTS", "0"
+        ).lower() in {"1", "true", "on"}
+        source_alias = getattr(layer, "weight", None)
+        if (
+            release_source
+            and self.w_q_name != "weight"
+            and source_alias is not None
+            and source_alias.untyped_storage().data_ptr()
+            == quantized.untyped_storage().data_ptr()
+        ):
+            replace_parameter(
+                layer,
+                "weight",
+                torch.nn.Parameter(
+                    torch.empty(0, dtype=quantized.dtype, device=quantized.device),
+                    requires_grad=False,
+                ),
+            )
+        if config.group_size == 128:
+            def prepared_g128_apply(
+                x: torch.Tensor,
+                packed_rhs: torch.Tensor = rhs,
+                output_features: int = n,
+                input_features: int = k,
+            ) -> torch.Tensor:
+                return torch.ops.triton_jit_cpu.q4_linear_g128(
+                    x, packed_rhs, output_features, input_features
+                )
+
+            layer._flag_gems_q4_prepared_apply = prepared_g128_apply
+        else:
+            # Capture immutable load-time metadata once.  Decode invokes this
+            # method roughly 304 times/token in Qwen3.6-27B, so repeating shape
+            # unpacking, layer parameter lookup, and backend branches in every
+            # call is measurable even though the GEMV itself is native code.
+            def prepared_g32_apply(
+                x: torch.Tensor,
+                packed_rhs: torch.Tensor = rhs,
+                output_features: int = n,
+                input_features: int = k,
+            ) -> torch.Tensor:
+                return torch.ops.triton_jit_cpu.q4_linear_g32_asym_compact(
+                    x, packed_rhs, output_features, input_features
+                )
+
+            layer._flag_gems_q4_prepared_apply = prepared_g32_apply
         setattr(layer, self.w_s_name, None)
+        if packed_checkpoint:
+            setattr(layer, "weight_shape", None)
         self._flag_gems_libtriton_jit_q4_shape = (
             n, k, config.group_size
         )
@@ -2249,6 +2504,16 @@ def _enable_vllm_dynamic4bit_g128() -> None:
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        prepared_apply = getattr(layer, "_flag_gems_q4_prepared_apply", None)
+        if (
+            _USE_VLLM_FAST_APPLY
+            and prepared_apply is not None
+            and bias is None
+            and x.dtype == torch.bfloat16
+            and x.device.type == "cpu"
+            and x.is_contiguous()
+        ):
+            return prepared_apply(x)
         shape = getattr(self, "_flag_gems_libtriton_jit_q4_shape", None)
         if shape is None:
             return original_apply(self, layer, x, bias)
@@ -2257,22 +2522,85 @@ def _enable_vllm_dynamic4bit_g128() -> None:
         x_bf16 = x if source_dtype == torch.bfloat16 else x.to(torch.bfloat16)
         x_bf16 = x_bf16.contiguous()
         rhs = getattr(layer, self.w_q_name)
-        op = (
-            torch.ops.triton_jit_cpu.q4_linear_g128
-            if group_size == 128
-            else torch.ops.triton_jit_cpu.q4_linear_g32_asym
-        )
-        output = op(x_bf16, rhs, n, k)
+        if group_size == 128:
+            output = torch.ops.triton_jit_cpu.q4_linear_g128(
+                x_bf16, rhs, n, k
+            )
+        else:
+            output = torch.ops.triton_jit_cpu.q4_linear_g32_asym_compact(
+                x_bf16, rhs, n, k
+            )
         if source_dtype != torch.bfloat16:
             output = output.to(source_dtype)
         if bias is not None:
             output = output + bias.to(output.dtype)
         return output
 
+    def apply_swiglu_weights(
+        self,
+        layer: torch.nn.Module,
+        joined: torch.Tensor,
+    ) -> torch.Tensor | None:
+        shape = getattr(self, "_flag_gems_libtriton_jit_q4_shape", None)
+        if shape is None:
+            return None
+        n, k, group_size = shape
+        if (
+            group_size not in {32, 128}
+            or joined.dtype != torch.bfloat16
+            or joined.device.type != "cpu"
+            or not joined.is_contiguous()
+            or joined.shape[-1] != 2 * k
+        ):
+            return None
+        rhs = getattr(layer, self.w_q_name)
+        if group_size == 128:
+            if not hasattr(torch.ops.triton_jit_cpu, "q4_linear_g128_swiglu"):
+                return None
+            return torch.ops.triton_jit_cpu.q4_linear_g128_swiglu(
+                joined, rhs, n, k
+            )
+        return torch.ops.triton_jit_cpu.q4_linear_g32_asym_compact_swiglu(
+            joined, rhs, n, k
+        )
+
+    original_mlp_forward = Qwen2MoeMLP.forward
+    use_fused_swiglu = os.getenv(
+        "FLAGGEMS_Q4_FUSED_SWIGLU_DOWN", "1"
+    ).lower() in {"1", "true", "on"}
+
+    def qwen_mlp_forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up, _ = self.gate_up_proj(x)
+        kernel = _vllm_dynamic4bit_kernel(self.down_proj)
+        fused = None
+        if (
+            type(self)._flag_gems_fused_swiglu_active
+            and self.expert_gate is None
+            and self.down_proj.tp_size == 1
+            and self.down_proj.bias is None
+            and kernel is not None
+        ):
+            apply_swiglu = getattr(
+                kernel, "_flag_gems_apply_swiglu_weights", None
+            )
+            if apply_swiglu is not None:
+                fused = apply_swiglu(self.down_proj, gate_up)
+        if fused is not None:
+            return fused
+
+        out = self.act_fn(gate_up)
+        out, _ = self.down_proj(out)
+        if self.expert_gate is not None:
+            out = torch.nn.functional.sigmoid(self.expert_gate(x)[0]) * out
+        return out
+
     Dynamic4bitLinearKernel.process_weights_after_loading = (
         process_weights_after_loading
     )
     Dynamic4bitLinearKernel.apply_weights = apply_weights
+    Dynamic4bitLinearKernel._flag_gems_apply_swiglu_weights = (
+        apply_swiglu_weights
+    )
     Dynamic4bitLinearKernel._flag_gems_libtriton_jit_g128_enabled = True
     Dynamic4bitLinearKernel._flag_gems_libtriton_jit_g128_original_process = (
         original_process
@@ -2280,6 +2608,13 @@ def _enable_vllm_dynamic4bit_g128() -> None:
     Dynamic4bitLinearKernel._flag_gems_libtriton_jit_g128_original_apply = (
         original_apply
     )
+    if not getattr(Qwen2MoeMLP, "_flag_gems_fused_swiglu_enabled", False):
+        Qwen2MoeMLP.forward = qwen_mlp_forward
+        Qwen2MoeMLP._flag_gems_fused_swiglu_enabled = True
+        Qwen2MoeMLP._flag_gems_fused_swiglu_original_forward = (
+            original_mlp_forward
+        )
+    Qwen2MoeMLP._flag_gems_fused_swiglu_active = use_fused_swiglu
 
 
 def _enable_vllm_dynamic_int8() -> None:
@@ -2410,6 +2745,8 @@ def enable_vllm_q4_codegen(
         required_ops = (
             "q4_linear",
             "q4_linear_g32_asym",
+            "q4_linear_g32_asym_compact",
+            "q4_linear_g32_asym_compact_swiglu",
             "q4_linear_g128",
             "w8_linear",
             "w8_linear_kai",
@@ -2515,6 +2852,18 @@ def enable_vllm_q4_codegen(
                 if remove_weight:
                     layer.weight = torch.nn.Parameter(
                         torch.empty(0), requires_grad=False
+                    )
+                elif is_lm_head and os.getenv(
+                    "FLAGGEMS_RELEASE_BF16_LM_HEAD", "0"
+                ).lower() in {"1", "true", "on"}:
+                    # ParallelLMHead shares the generic embedding method, so
+                    # vLLM requests remove_weight=False even though this layer
+                    # is never used for token lookup. The prepared W8/Q4
+                    # closure ignores the original BF16 argument; retaining it
+                    # costs 2.37 GiB for Qwen3.6-27B.
+                    layer.weight = torch.nn.Parameter(
+                        torch.empty(0, dtype=weight.dtype, device=weight.device),
+                        requires_grad=False,
                     )
                 _STATS["prepared_linears"] += 1
                 return
