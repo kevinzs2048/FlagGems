@@ -2437,10 +2437,10 @@ def _enable_vllm_dynamic4bit_g128() -> None:
         # only one signed INT4 code. For Qwen3.6-27B that stale alias retains
         # 22.68 GiB in addition to the 12.77 GiB compact runtime layout.
         # Inference uses `weight_packed` through this kernel, so the `weight`
-        # alias can be released after packing. Keep this gated for exact/E2E
-        # validation before making it the production default.
+        # alias can be released after packing. Retaining it is an explicit
+        # debugging option; production defaults to the compact runtime copy.
         release_source = os.getenv(
-            "FLAGGEMS_Q4_RELEASE_SOURCE_WEIGHTS", "0"
+            "FLAGGEMS_Q4_RELEASE_SOURCE_WEIGHTS", "1"
         ).lower() in {"1", "true", "on"}
         source_alias = getattr(layer, "weight", None)
         if (
@@ -2736,11 +2736,12 @@ def enable_vllm_q4_codegen(
     if runtime not in {"python", "libtriton_jit"}:
         raise ValueError("Q4 codegen runtime must be 'python' or 'libtriton_jit'")
     if runtime == "libtriton_jit":
-        library = os.getenv("FLAGGEMS_LIBTRITON_JIT_Q4_OP")
-        if not library:
-            raise RuntimeError(
-                "FLAGGEMS_LIBTRITON_JIT_Q4_OP must name the C++ operator library"
-            )
+        from flag_gems.csrc.arm import configure_runtime
+
+        try:
+            library = configure_runtime()
+        except FileNotFoundError as error:
+            raise RuntimeError(str(error)) from error
         torch.ops.load_library(os.path.realpath(library))
         required_ops = (
             "q4_linear",
@@ -2854,7 +2855,7 @@ def enable_vllm_q4_codegen(
                         torch.empty(0), requires_grad=False
                     )
                 elif is_lm_head and os.getenv(
-                    "FLAGGEMS_RELEASE_BF16_LM_HEAD", "0"
+                    "FLAGGEMS_RELEASE_BF16_LM_HEAD", "1"
                 ).lower() in {"1", "true", "on"}:
                     # ParallelLMHead shares the generic embedding method, so
                     # vLLM requests remove_weight=False even though this layer

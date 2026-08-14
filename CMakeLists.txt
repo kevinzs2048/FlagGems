@@ -40,18 +40,24 @@ endif()
 # ==============================================================================
 # Backend Selection
 # ==============================================================================
-set(FLAGGEMS_BACKEND "CUDA" CACHE STRING "Target backend: CUDA, IX, MUSA, NPU, GCU")
-set_property(CACHE FLAGGEMS_BACKEND PROPERTY STRINGS "CUDA" "IX" "MUSA" "NPU" "GCU")
+set(FLAGGEMS_BACKEND "CUDA" CACHE STRING "Target backend: CUDA, IX, MUSA, NPU, GCU, ARM")
+set_property(CACHE FLAGGEMS_BACKEND PROPERTY STRINGS "CUDA" "IX" "MUSA" "NPU" "GCU" "ARM")
 
-if(NOT FLAGGEMS_BACKEND MATCHES "^(CUDA|IX|MUSA|NPU|GCU)$")
+if(NOT FLAGGEMS_BACKEND MATCHES "^(CUDA|IX|MUSA|NPU|GCU|ARM)$")
     message(FATAL_ERROR "Invalid FLAGGEMS_BACKEND: ${FLAGGEMS_BACKEND}")
 endif()
 message(STATUS "Building FlagGems with backend: ${FLAGGEMS_BACKEND}")
 
+if(FLAGGEMS_BACKEND STREQUAL "ARM" AND NOT FLAGGEMS_USE_EXTERNAL_TRITON_JIT)
+  message(FATAL_ERROR
+    "The ARM operator bundle requires a CPU-enabled external libtriton_jit; "
+    "set FLAGGEMS_USE_EXTERNAL_TRITON_JIT=ON and TritonJIT_DIR")
+endif()
 # NPU, MUSA and GCU do not need CUDA language
 if(FLAGGEMS_BACKEND STREQUAL "NPU"
    OR FLAGGEMS_BACKEND STREQUAL "MUSA"
-   OR FLAGGEMS_BACKEND STREQUAL "GCU")
+   OR FLAGGEMS_BACKEND STREQUAL "GCU"
+   OR FLAGGEMS_BACKEND STREQUAL "ARM")
     project(FlagGems LANGUAGES CXX VERSION 0.1.0)
 else()
     project(FlagGems LANGUAGES CUDA CXX VERSION 0.1.0)
@@ -68,6 +74,8 @@ elseif(FLAGGEMS_BACKEND STREQUAL "MUSA")
     add_compile_definitions(FLAGGEMS_USE_MUSA)
 elseif(FLAGGEMS_BACKEND STREQUAL "GCU")
     add_compile_definitions(FLAGGEMS_USE_GCU)
+elseif(FLAGGEMS_BACKEND STREQUAL "ARM")
+    add_compile_definitions(FLAGGEMS_USE_ARM)
 endif()
 
 message(STATUS "Building flag gems with C extensions")
@@ -89,6 +97,13 @@ endif()
 
 # torch
 find_package(Torch MODULE REQUIRED) # This is the FindTorch.cmake
+# A CPU-enabled libtriton_jit exports OpenMP in its public link interface.
+# Define that imported target in the same CMake directory before loading the
+# external TritonJIT package; a child-directory FindOpenMP target is scoped too
+# narrowly for the imported parent target.
+if(FLAGGEMS_BACKEND STREQUAL "ARM")
+  find_package(OpenMP REQUIRED COMPONENTS CXX)
+endif()
 # dependencies: json
 if(FLAGGEMS_USE_EXTERNAL_TRITON_JIT)
   find_package(TritonJIT 0.1.0 CONFIG REQUIRED)
@@ -143,6 +158,10 @@ endif()
 message(STATUS "Detected Triton version: ${TRITON_VERSION}")
 
 # --------------------------- subdirectories ---------------------------
+if(FLAGGEMS_BACKEND STREQUAL "ARM")
+  add_subdirectory(src/flag_gems/csrc/arm)
+  return()
+endif()
 add_subdirectory(lib)
 add_subdirectory(src/flag_gems/csrc)
 if(FLAGGEMS_BUILD_CTESTS)
