@@ -14,6 +14,29 @@ if(NOT TARGET Torch::Torch)
 endif()
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 
+function(flag_gems_relocate_openmp target)
+  if(APPLE AND OpenMP_libomp_LIBRARY)
+    get_filename_component(_flag_gems_openmp_dir
+      "${OpenMP_libomp_LIBRARY}" DIRECTORY)
+    set_property(TARGET "${target}" APPEND PROPERTY
+      BUILD_RPATH "${_flag_gems_openmp_dir}")
+    execute_process(
+      COMMAND /usr/bin/otool -D "${OpenMP_libomp_LIBRARY}"
+      OUTPUT_VARIABLE _flag_gems_openmp_id_output
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      COMMAND_ERROR_IS_FATAL ANY)
+    string(REPLACE "\n" ";" _flag_gems_openmp_id_lines
+      "${_flag_gems_openmp_id_output}")
+    list(GET _flag_gems_openmp_id_lines -1 _flag_gems_openmp_id)
+    string(STRIP "${_flag_gems_openmp_id}" _flag_gems_openmp_id)
+    add_custom_command(TARGET "${target}" POST_BUILD
+      COMMAND "${CMAKE_INSTALL_NAME_TOOL}" -change
+        "${_flag_gems_openmp_id}" "@rpath/libomp.dylib"
+        "$<TARGET_FILE:${target}>"
+      VERBATIM)
+  endif()
+endfunction()
+
 if(NOT TARGET triton_jit)
   if(NOT DEFINED TRITON_JIT_ROOT OR NOT DEFINED TRITON_JIT_BUILD)
     message(FATAL_ERROR
@@ -39,13 +62,7 @@ if(APPLE)
   set_target_properties(flag_gems_arm_ops PROPERTIES
     BUILD_RPATH "@loader_path;${TRITON_JIT_BUILD}/src"
     INSTALL_RPATH "@loader_path")
-  if(OpenMP_libomp_LIBRARY)
-    add_custom_command(TARGET flag_gems_arm_ops POST_BUILD
-      COMMAND "${CMAKE_INSTALL_NAME_TOOL}" -change
-        "${OpenMP_libomp_LIBRARY}" "@rpath/libomp.dylib"
-        "$<TARGET_FILE:flag_gems_arm_ops>"
-      VERBATIM)
-  endif()
+  flag_gems_relocate_openmp(flag_gems_arm_ops)
 elseif(UNIX)
   set_target_properties(flag_gems_arm_ops PROPERTIES
     BUILD_RPATH "$ORIGIN;${TRITON_JIT_BUILD}/src"
