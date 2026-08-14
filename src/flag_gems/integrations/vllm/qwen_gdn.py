@@ -14,6 +14,23 @@ import torch
 import torch.nn.functional as F
 
 _INSTALLED = False
+_COVERAGE_ENABLED = "FLAGGEMS_KERNEL_COVERAGE_FILE" in os.environ
+_ROUTE_STATS: dict[str, int] = {}
+
+
+def _record_route(name: str) -> None:
+    if _COVERAGE_ENABLED:
+        _ROUTE_STATS[name] = _ROUTE_STATS.get(name, 0) + 1
+
+
+def route_stats() -> dict[str, int]:
+    """Return GDN route counters collected by an explicitly armed run."""
+    return dict(_ROUTE_STATS)
+
+
+def reset_route_stats() -> None:
+    """Reset counters before a one-shot kernel coverage request."""
+    _ROUTE_STATS.clear()
 
 
 def _enabled(name: str, default: str = "0") -> bool:
@@ -127,6 +144,7 @@ def torch_causal_conv1d_fn(
         and weight.ndim == 2
         and activation in ("silu", "swish")
     ):
+        _record_route("native_conv_prefill")
         return torch.ops.triton_jit_cpu.gdn_conv1d_prefill(
             x,
             conv_states,
@@ -138,6 +156,7 @@ def torch_causal_conv1d_fn(
             True,
         )
 
+    _record_route("fallback_conv_prefill")
     offsets = query_start_loc.detach().cpu().tolist()
     output = torch.zeros_like(x)
     for sequence, (begin, end) in enumerate(pairwise(offsets)):
@@ -190,6 +209,7 @@ def torch_causal_conv1d_update(
         and weight.ndim == 2
         and activation in (True, "silu", "swish")
     ):
+        _record_route("native_conv_decode")
         return torch.ops.triton_jit_cpu.gdn_conv1d_update(
             x,
             conv_state,
@@ -199,6 +219,7 @@ def torch_causal_conv1d_update(
             True,
         )
 
+    _record_route("fallback_conv_decode")
     output = torch.zeros_like(x)
     if query_start_loc is None:
         if x.ndim == 2:
@@ -303,6 +324,7 @@ def torch_chunk_gated_delta_rule(
         and q.ndim == 4
         and q.shape[0] == 1
     ):
+        _record_route("native_gdn_prefill")
         state = initial_state.contiguous()
         output = torch.ops.triton_jit_cpu.gdn_prefill(
             q,
@@ -316,6 +338,7 @@ def torch_chunk_gated_delta_rule(
         )
         return output, state
 
+    _record_route("fallback_gdn_prefill")
     batch, tokens, _, key_dim = q.shape
     value_heads = v.shape[-2]
     output = torch.empty_like(v)
@@ -398,6 +421,7 @@ def torch_fused_sigmoid_gating_delta_rule_update(
         scale=scale,
     ):
         assert ssm_state_indices is not None
+        _record_route("native_gdn_decode")
         return (
             torch.ops.triton_jit_cpu.gdn_decode(
                 A_log,
@@ -414,6 +438,7 @@ def torch_fused_sigmoid_gating_delta_rule_update(
             initial_state,
         )
 
+    _record_route("fallback_gdn_decode")
     batch, tokens, _, key_dim = q.shape
     value_heads = v.shape[-2]
     scale = key_dim**-0.5 if scale is None else scale
@@ -586,6 +611,7 @@ def install_vllm_gdn() -> None:
             int(os.getenv("FLAGGEMS_GDN_TRITON_BLOCK_KEY", "0")),
             int(os.getenv("FLAGGEMS_GDN_TRITON_THREADS", "0")),
         )
+        _record_route("triton_packed_decode")
         return True
 
     def native_packed_decode(
@@ -600,6 +626,7 @@ def install_vllm_gdn() -> None:
             not _enabled("FLAGGEMS_GDN_NATIVE_PACKED_DECODE", "1")
             or not hasattr(torch.ops.triton_jit_cpu, "gdn_packed_decode")
         ):
+            _record_route("fallback_packed_decode")
             return original_packed_decode(
                 self, mixed_qkv, b, a, core_attn_out, attn_metadata
             )
@@ -638,6 +665,7 @@ def install_vllm_gdn() -> None:
             core_attn_out[:num_tokens],
             True,
         )
+        _record_route("native_packed_decode")
 
     gdn.GatedDeltaNetAttention._forward_core_decode_non_spec = native_packed_decode
 
@@ -718,6 +746,7 @@ def install_vllm_gdn() -> None:
                 core_attn_out,
                 True,
             )
+        _record_route("native_fast_forward")
         normalized = self.norm(
             core_attn_out.reshape(-1, self.head_v_dim),
             z.reshape(-1, self.head_v_dim),
@@ -833,6 +862,8 @@ def install_vllm_gdn() -> None:
 
 __all__ = [
     "install_vllm_gdn",
+    "reset_route_stats",
+    "route_stats",
     "torch_causal_conv1d_fn",
     "torch_causal_conv1d_update",
     "torch_chunk_gated_delta_rule",
