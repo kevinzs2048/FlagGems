@@ -22,3 +22,25 @@ external Triton JIT package, and pass its `TritonJIT_DIR`. The library and the
 two Python kernel-entry modules are installed together under
 `flag_gems/csrc/arm`; `configure_runtime()` resolves them without developer
 absolute paths.
+
+## Coarse prefill scheduling
+
+The W4 G128 and W8 prefill kernels have an optional coarse-N scheduling mode.
+Instead of exposing every M-by-N4 tile as an independent CPU program, one
+worker claims a short contiguous N4 stripe and runs all M16 tiles for that
+stripe inside the Triton program.  The C++ operator only allocates the atomic
+counter and launches the grid; packing, I8MM accumulation and epilogue math
+remain in the versioned Triton sources.
+
+The generic library default is disabled because the profitable stripe size is
+CPU- and shape-dependent.  A platform profile may enable a measured policy:
+
+- W4 G128: `FLAGGEMS_ARM_Q4_G128_STEALING_PREFILL=1` and
+  `FLAGGEMS_ARM_Q4_G128_STEAL_CHUNK={1,2,4,8,16,32}`.
+- W8: `FLAGGEMS_W8_STEALING_PREFILL=1` and
+  `FLAGGEMS_W8_PREFILL_STEAL_CHUNK=<1..32>`.
+
+Decode is selected independently and continues to use the SDOT kernels for
+single-token inputs.  The Arm runtime tests compare regular-grid and
+coarse-stripe outputs bit-for-bit before a deployment profile enables either
+prefill policy.
