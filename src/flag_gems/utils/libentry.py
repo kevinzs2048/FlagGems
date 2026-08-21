@@ -4,8 +4,8 @@ import hashlib
 import inspect
 import logging
 import math
-import multiprocessing
 import os
+import threading
 import time
 from abc import abstractmethod
 from collections import OrderedDict
@@ -742,7 +742,12 @@ class LibEntry(triton.KernelInterface):
             for p in self.jit_function.params
             if not p.is_constexpr and p.do_not_specialize
         ]
-        self.lock = multiprocessing.Lock()
+        # ``kernel_cache`` and Triton's runtime are both process-local.  A
+        # process-shared semaphore cannot protect cache state in another
+        # interpreter and needlessly consumes one OS semaphore per decorated
+        # kernel (a finite resource on macOS).  We only need to serialize JIT
+        # compilation between threads in this interpreter.
+        self.lock = threading.Lock()
         self.signature = fn.signature
 
     @staticmethod

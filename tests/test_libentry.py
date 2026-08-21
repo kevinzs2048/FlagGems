@@ -18,6 +18,11 @@ from flag_gems.utils.code_cache import config_cache_dir
 from flag_gems.utils.libentry import libcache, major_version, minor_version
 
 
+def test_libentry_uses_process_local_thread_lock():
+    """JIT cache serialization must not allocate an OS process semaphore."""
+    assert type(softmax_kernel_inner.lock) is type(threading.Lock())
+
+
 # not_raises is copied from https://gist.github.com/oisinmulvihill/45c14271fad7794a4a52516ecb784e69
 @contextmanager
 def not_raises(ExpectedException):
