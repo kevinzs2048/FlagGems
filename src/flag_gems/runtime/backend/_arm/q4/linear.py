@@ -2458,34 +2458,10 @@ def _enable_vllm_dynamic4bit_g128() -> None:
                     requires_grad=False,
                 ),
             )
-        if config.group_size == 128:
-            def prepared_g128_apply(
-                x: torch.Tensor,
-                packed_rhs: torch.Tensor = rhs,
-                output_features: int = n,
-                input_features: int = k,
-            ) -> torch.Tensor:
-                return torch.ops.triton_jit_cpu.q4_linear_g128(
-                    x, packed_rhs, output_features, input_features
-                )
-
-            layer._flag_gems_q4_prepared_apply = prepared_g128_apply
-        else:
-            # Capture immutable load-time metadata once.  Decode invokes this
-            # method roughly 304 times/token in Qwen3.6-27B, so repeating shape
-            # unpacking, layer parameter lookup, and backend branches in every
-            # call is measurable even though the GEMV itself is native code.
-            def prepared_g32_apply(
-                x: torch.Tensor,
-                packed_rhs: torch.Tensor = rhs,
-                output_features: int = n,
-                input_features: int = k,
-            ) -> torch.Tensor:
-                return torch.ops.triton_jit_cpu.q4_linear_g32_asym_compact(
-                    x, packed_rhs, output_features, input_features
-                )
-
-            layer._flag_gems_q4_prepared_apply = prepared_g32_apply
+        # Store only serializable data on the kernel object.  The previous
+        # function-valued shortcut made Torch AOT deepcopy fail.
+        if _USE_VLLM_FAST_APPLY:
+            self._flag_gems_q4_prepared_rhs = rhs
         setattr(layer, self.w_s_name, None)
         if packed_checkpoint:
             setattr(layer, "weight_shape", None)
@@ -2504,17 +2480,28 @@ def _enable_vllm_dynamic4bit_g128() -> None:
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        prepared_apply = getattr(layer, "_flag_gems_q4_prepared_apply", None)
+        prepared_rhs = getattr(self, "_flag_gems_q4_prepared_rhs", None)
+        prepared_shape = getattr(
+            self, "_flag_gems_libtriton_jit_q4_shape", None
+        )
         if (
             _USE_VLLM_FAST_APPLY
-            and prepared_apply is not None
+            and prepared_rhs is not None
+            and prepared_shape is not None
             and bias is None
             and x.dtype == torch.bfloat16
             and x.device.type == "cpu"
             and x.is_contiguous()
         ):
-            return prepared_apply(x)
-        shape = getattr(self, "_flag_gems_libtriton_jit_q4_shape", None)
+            n, k, group_size = prepared_shape
+            if group_size == 128:
+                return torch.ops.triton_jit_cpu.q4_linear_g128(
+                    x, prepared_rhs, n, k
+                )
+            return torch.ops.triton_jit_cpu.q4_linear_g32_asym_compact(
+                x, prepared_rhs, n, k
+            )
+        shape = prepared_shape
         if shape is None:
             return original_apply(self, layer, x, bias)
         n, k, group_size = shape
