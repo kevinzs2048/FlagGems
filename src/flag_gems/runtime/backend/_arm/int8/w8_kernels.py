@@ -334,17 +334,19 @@ def _w8_qai8dxp_decode_stealing_sdot_kernel(
 
 
 @triton.jit
-def _w8_qai8dxp_prefill_i8mm_kernel(
+def _w8_qai8dxp_prefill_i8mm_tile(
     lhs_packed_ptr,
     rhs_packed_ptr,
     out_ptr,
     N: tl.constexpr,
     K: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    PID_M_OVERRIDE: tl.constexpr,
+    PID_N_OVERRIDE: tl.constexpr,
 ):
     """Exact-KAI asymmetric M16/N4 prefill, lowered to target I8MM."""
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid_m = PID_M_OVERRIDE
+    pid_n = PID_N_OVERRIDE
     rows = tl.arange(0, BLOCK_M)
     cols = tl.arange(0, 4)
     panel_offsets = tl.arange(0, 128)
@@ -448,6 +450,59 @@ def _w8_qai8dxp_prefill_i8mm_kernel(
         out_ptr + output_rows[:, None] * N + output_cols[None, :],
         result.to(tl.bfloat16),
     )
+
+
+@triton.jit
+def _w8_qai8dxp_prefill_i8mm_kernel(
+    lhs_packed_ptr,
+    rhs_packed_ptr,
+    out_ptr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    _w8_qai8dxp_prefill_i8mm_tile(
+        lhs_packed_ptr,
+        rhs_packed_ptr,
+        out_ptr,
+        N=N,
+        K=K,
+        BLOCK_M=BLOCK_M,
+        PID_M_OVERRIDE=tl.program_id(0),
+        PID_N_OVERRIDE=tl.program_id(1),
+    )
+
+
+@triton.jit
+def _w8_qai8dxp_prefill_stealing_n_i8mm_kernel(
+    lhs_packed_ptr,
+    rhs_packed_ptr,
+    out_ptr,
+    counter_ptr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    M_TILES: tl.constexpr,
+    STEAL_CHUNK: tl.constexpr,
+):
+    """Dynamically distribute coarse N4 stripes across CPU workers."""
+    counter_ptr = counter_ptr.to(tl.pointer_type(tl.int32))
+    n_tiles: tl.constexpr = N // 4
+    n_begin = tl.atomic_add(counter_ptr, STEAL_CHUNK)
+    while n_begin < n_tiles:
+        n_end = tl.minimum(n_begin + STEAL_CHUNK, n_tiles)
+        for pid_n in range(n_begin, n_end):
+            for pid_m in tl.range(0, M_TILES, loop_unroll_factor=1):
+                _w8_qai8dxp_prefill_i8mm_tile(
+                    lhs_packed_ptr,
+                    rhs_packed_ptr,
+                    out_ptr,
+                    N=N,
+                    K=K,
+                    BLOCK_M=16,
+                    PID_M_OVERRIDE=pid_m,
+                    PID_N_OVERRIDE=pid_n,
+                )
+        n_begin = tl.atomic_add(counter_ptr, STEAL_CHUNK)
 
 
 @triton.jit

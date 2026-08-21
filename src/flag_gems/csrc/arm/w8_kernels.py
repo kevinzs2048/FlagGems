@@ -18,6 +18,7 @@ from flag_gems.runtime.backend._arm.int8.w8_kernels import (
     _w8_qai8dxp_decode_sdot_kernel,
     _w8_qai8dxp_decode_stealing_sdot_kernel,
     _w8_qai8dxp_prefill_i8mm_kernel,
+    _w8_qai8dxp_prefill_stealing_n_i8mm_kernel,
     _w8_qai8dxp_prefill_m12_kernel,
     _w8_qai8dxp_prefill_short_tail_kernel,
 )
@@ -36,6 +37,7 @@ __all__ = [
     "_w8_qai8dxp_decode_sdot_kernel",
     "_w8_qai8dxp_decode_stealing_sdot_kernel",
     "_w8_qai8dxp_prefill_i8mm_kernel",
+    "_w8_qai8dxp_prefill_stealing_n_i8mm_kernel",
     "_w8_qai8dxp_prefill_m12_kernel",
     "_w8_qai8dxp_prefill_short_tail_kernel",
 ]

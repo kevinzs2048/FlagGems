@@ -123,6 +123,29 @@ int32_t kai_steal_chunk() {
   return static_cast<int32_t>(parsed);
 }
 
+bool use_kai_stealing_prefill() {
+  const char* configured = std::getenv("FLAGGEMS_W8_STEALING_PREFILL");
+  if (configured == nullptr) {
+    return false;
+  }
+  return std::strcmp(configured, "0") != 0 &&
+      std::strcmp(configured, "false") != 0 &&
+      std::strcmp(configured, "off") != 0;
+}
+
+int32_t kai_prefill_steal_chunk() {
+  const char* configured = std::getenv("FLAGGEMS_W8_PREFILL_STEAL_CHUNK");
+  if (configured == nullptr) {
+    return 2;
+  }
+  char* end = nullptr;
+  const long parsed = std::strtol(configured, &end, 10);
+  TORCH_CHECK(end != configured && *end == '\0' && parsed > 0 &&
+                  parsed <= 32,
+              "FLAGGEMS_W8_PREFILL_STEAL_CHUNK must be in [1,32]");
+  return static_cast<int32_t>(parsed);
+}
+
 at::Tensor run_decode(const at::Tensor& input,
                       const at::Tensor& decode_rhs,
                       const at::Tensor& scale,
@@ -364,20 +387,43 @@ at::Tensor run_kai_prefill(const at::Tensor& input,
 
   const int32_t main_rows = (m32 / 16) * 16;
   if (main_rows > 0) {
-    TritonJITFunction& matrix = TritonJITFunction::get_instance(
-        W8_KERNEL_SOURCE, "_w8_qai8dxp_prefill_i8mm_kernel");
-    matrix(nullptr,
-           static_cast<unsigned int>(main_rows / 16),
-           static_cast<unsigned int>(n32 / 4),
-           1,
-           1,
-           1,
-           lhs,
-           rhs,
-           output,
-           n32,
-           k32,
-           16);
+    if (use_kai_stealing_prefill() && main_rows > 16) {
+      TritonJITFunction& matrix = TritonJITFunction::get_instance(
+          W8_KERNEL_SOURCE,
+          "_w8_qai8dxp_prefill_stealing_n_i8mm_kernel");
+      const int32_t partitions = std::min<int32_t>(
+          std::max(1, at::get_num_threads()), n32 / 4);
+      at::Tensor counter = at::zeros({1}, input.options().dtype(at::kInt));
+      matrix(nullptr,
+             static_cast<unsigned int>(partitions),
+             1,
+             1,
+             1,
+             1,
+             lhs,
+             rhs,
+             output,
+             counter,
+             n32,
+             k32,
+             main_rows / 16,
+             kai_prefill_steal_chunk());
+    } else {
+      TritonJITFunction& matrix = TritonJITFunction::get_instance(
+          W8_KERNEL_SOURCE, "_w8_qai8dxp_prefill_i8mm_kernel");
+      matrix(nullptr,
+             static_cast<unsigned int>(main_rows / 16),
+             static_cast<unsigned int>(n32 / 4),
+             1,
+             1,
+             1,
+             lhs,
+             rhs,
+             output,
+             n32,
+             k32,
+             16);
+    }
   }
 
   const int32_t remaining = m32 - main_rows;
