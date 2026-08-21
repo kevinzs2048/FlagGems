@@ -3893,19 +3893,22 @@ def _q4_load_g128_k32_i8mm_lhs(lhs_blob):
 
 
 @triton.jit
-def _q4_prefill_asym_g128_i8mm_kernel(
+def _q4_prefill_asym_g128_i8mm_tile(
     lhs_packed_ptr,
     rhs_packed_ptr,
     out_ptr,
     N: tl.constexpr,
     K: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    GROUPS128_RUNTIME,
+    PID_M_OVERRIDE: tl.constexpr,
+    PID_N_OVERRIDE: tl.constexpr,
     LHS_KAI: tl.constexpr = False,
     SUBGROUP_UNROLL: tl.constexpr = 1,
 ):
     """G128 Q4 prefill: four K32 SMMLA bodies per scale/correction."""
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid_m = PID_M_OVERRIDE
+    pid_n = PID_N_OVERRIDE
     block_n: tl.constexpr = 4
     groups128: tl.constexpr = K // 128
     num_panels: tl.constexpr = BLOCK_M // 4
@@ -3928,6 +3931,75 @@ def _q4_prefill_asym_g128_i8mm_kernel(
         lhs_data_offset: tl.constexpr = 16
         lhs_zp_offset: tl.constexpr = 8
     lhs_row_base = lhs_packed_ptr + pid_m * num_panels * lhs_panel_stride
+
+    rhs_tile_stride: tl.constexpr = groups128 * 264 + 16
+    rhs_tile_ptr = rhs_packed_ptr + pid_n * rhs_tile_stride
+
+    # Keep the G128 reduction as tl.range rather than static_range.  The CPU
+    # backend can then preserve a compact loop at production K sizes instead
+    # of cloning the full M16 microkernel and spilling its accumulators.
+    for group128 in tl.range(0, GROUPS128_RUNTIME, loop_unroll_factor=1):
+        rhs_blob = rhs_tile_ptr + group128 * 264
+        rhs_scale = tl.load(
+            rhs_blob.to(tl.pointer_type(tl.bfloat16)) + tl.arange(0, 4)
+        ).to(tl.float32)
+        dot0 = tl.zeros((4, block_n), dtype=tl.int32)
+        if BLOCK_M >= 8:
+            dot1 = tl.zeros((4, block_n), dtype=tl.int32)
+        if BLOCK_M >= 12:
+            dot2 = tl.zeros((4, block_n), dtype=tl.int32)
+        if BLOCK_M >= 16:
+            dot3 = tl.zeros((4, block_n), dtype=tl.int32)
+        for subgroup in tl.range(
+            0, 4, loop_unroll_factor=SUBGROUP_UNROLL
+        ):
+            group32 = group128 * 4 + subgroup
+            weight = _q4_load_g128_k32_i8mm_weight(
+                rhs_blob + 8 + subgroup * 64
+            )
+            lhs0_blob = lhs_row_base + lhs_data_offset + group32 * 128
+            dot0 += tl.dot(
+                _q4_load_g128_k32_i8mm_lhs(lhs0_blob),
+                weight,
+                out_dtype=tl.int32,
+            )
+            if BLOCK_M >= 8:
+                dot1 += tl.dot(
+                    _q4_load_g128_k32_i8mm_lhs(
+                        lhs0_blob + lhs_panel_stride
+                    ),
+                    weight,
+                    out_dtype=tl.int32,
+                )
+            if BLOCK_M >= 12:
+                dot2 += tl.dot(
+                    _q4_load_g128_k32_i8mm_lhs(
+                        lhs0_blob + 2 * lhs_panel_stride
+                    ),
+                    weight,
+                    out_dtype=tl.int32,
+                )
+            if BLOCK_M >= 16:
+                dot3 += tl.dot(
+                    _q4_load_g128_k32_i8mm_lhs(
+                        lhs0_blob + 3 * lhs_panel_stride
+                    ),
+                    weight,
+                    out_dtype=tl.int32,
+                )
+
+        result0 += dot0.to(tl.float32) * rhs_scale[None, :]
+        if BLOCK_M >= 8:
+            result1 += dot1.to(tl.float32) * rhs_scale[None, :]
+        if BLOCK_M >= 12:
+            result2 += dot2.to(tl.float32) * rhs_scale[None, :]
+        if BLOCK_M >= 16:
+            result3 += dot3.to(tl.float32) * rhs_scale[None, :]
+
+    # These correction values do not participate in the I8MM loop.  Loading
+    # them here (rather than above it) keeps up to eight SIMD values out of the
+    # hot loop's live range, which is essential for an M16 tile on AArch64's
+    # 32-vector register file.
     if LHS_KAI:
         scale0 = tl.load(
             lhs_row_base.to(tl.pointer_type(tl.float32)) + lanes_m4
@@ -3994,67 +4066,6 @@ def _q4_prefill_asym_g128_i8mm_kernel(
             + lanes_m4
         ).to(tl.int8).to(tl.int32)
 
-    rhs_tile_stride: tl.constexpr = groups128 * 264 + 16
-    rhs_tile_ptr = rhs_packed_ptr + pid_n * rhs_tile_stride
-
-    for group128 in tl.range(0, groups128, loop_unroll_factor=1):
-        rhs_blob = rhs_tile_ptr + group128 * 264
-        rhs_scale = tl.load(
-            rhs_blob.to(tl.pointer_type(tl.bfloat16)) + tl.arange(0, 4)
-        ).to(tl.float32)
-        dot0 = tl.zeros((4, block_n), dtype=tl.int32)
-        if BLOCK_M >= 8:
-            dot1 = tl.zeros((4, block_n), dtype=tl.int32)
-        if BLOCK_M >= 12:
-            dot2 = tl.zeros((4, block_n), dtype=tl.int32)
-        if BLOCK_M >= 16:
-            dot3 = tl.zeros((4, block_n), dtype=tl.int32)
-        for subgroup in tl.range(
-            0, 4, loop_unroll_factor=SUBGROUP_UNROLL
-        ):
-            group32 = group128 * 4 + subgroup
-            weight = _q4_load_g128_k32_i8mm_weight(
-                rhs_blob + 8 + subgroup * 64
-            )
-            lhs0_blob = lhs_row_base + lhs_data_offset + group32 * 128
-            dot0 += tl.dot(
-                _q4_load_g128_k32_i8mm_lhs(lhs0_blob),
-                weight,
-                out_dtype=tl.int32,
-            )
-            if BLOCK_M >= 8:
-                dot1 += tl.dot(
-                    _q4_load_g128_k32_i8mm_lhs(
-                        lhs0_blob + lhs_panel_stride
-                    ),
-                    weight,
-                    out_dtype=tl.int32,
-                )
-            if BLOCK_M >= 12:
-                dot2 += tl.dot(
-                    _q4_load_g128_k32_i8mm_lhs(
-                        lhs0_blob + 2 * lhs_panel_stride
-                    ),
-                    weight,
-                    out_dtype=tl.int32,
-                )
-            if BLOCK_M >= 16:
-                dot3 += tl.dot(
-                    _q4_load_g128_k32_i8mm_lhs(
-                        lhs0_blob + 3 * lhs_panel_stride
-                    ),
-                    weight,
-                    out_dtype=tl.int32,
-                )
-
-        result0 += dot0.to(tl.float32) * rhs_scale[None, :]
-        if BLOCK_M >= 8:
-            result1 += dot1.to(tl.float32) * rhs_scale[None, :]
-        if BLOCK_M >= 12:
-            result2 += dot2.to(tl.float32) * rhs_scale[None, :]
-        if BLOCK_M >= 16:
-            result3 += dot3.to(tl.float32) * rhs_scale[None, :]
-
     weighted_sum_scaled16 = tl.load(
         (rhs_tile_ptr + groups128 * 264).to(tl.pointer_type(tl.float32))
         + tl.arange(0, 4)
@@ -4091,6 +4102,70 @@ def _q4_prefill_asym_g128_i8mm_kernel(
             out_ptr + (output_row + 12 + lanes_m4)[:, None] * N + cols[None, :],
             result3.to(tl.bfloat16),
         )
+
+
+@triton.jit
+def _q4_prefill_asym_g128_i8mm_kernel(
+    lhs_packed_ptr,
+    rhs_packed_ptr,
+    out_ptr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    LHS_KAI: tl.constexpr = False,
+    SUBGROUP_UNROLL: tl.constexpr = 1,
+):
+    _q4_prefill_asym_g128_i8mm_tile(
+        lhs_packed_ptr,
+        rhs_packed_ptr,
+        out_ptr,
+        N=N,
+        K=K,
+        BLOCK_M=BLOCK_M,
+        GROUPS128_RUNTIME=K // 128,
+        LHS_KAI=LHS_KAI,
+        SUBGROUP_UNROLL=SUBGROUP_UNROLL,
+        PID_M_OVERRIDE=tl.program_id(0),
+        PID_N_OVERRIDE=tl.program_id(1),
+    )
+
+
+@triton.jit
+def _q4_prefill_asym_g128_stealing_n_i8mm_kernel(
+    lhs_packed_ptr,
+    rhs_packed_ptr,
+    out_ptr,
+    counter_ptr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    M_TILES: tl.constexpr,
+    LHS_KAI: tl.constexpr = False,
+    SUBGROUP_UNROLL: tl.constexpr = 1,
+    STEAL_CHUNK: tl.constexpr = 8,
+):
+    """Dynamically distribute coarse N4 stripes across CPU workers."""
+    counter_ptr = counter_ptr.to(tl.pointer_type(tl.int32))
+    n_tiles: tl.constexpr = N // 4
+    n_begin = tl.atomic_add(counter_ptr, STEAL_CHUNK)
+    while n_begin < n_tiles:
+        n_end = tl.minimum(n_begin + STEAL_CHUNK, n_tiles)
+        for pid_n in range(n_begin, n_end):
+            for pid_m in tl.range(0, M_TILES, loop_unroll_factor=1):
+                _q4_prefill_asym_g128_i8mm_tile(
+                    lhs_packed_ptr,
+                    rhs_packed_ptr,
+                    out_ptr,
+                    N=N,
+                    K=K,
+                    BLOCK_M=BLOCK_M,
+                    GROUPS128_RUNTIME=K // 128,
+                    LHS_KAI=LHS_KAI,
+                    SUBGROUP_UNROLL=SUBGROUP_UNROLL,
+                    PID_M_OVERRIDE=pid_m,
+                    PID_N_OVERRIDE=pid_n,
+                )
+        n_begin = tl.atomic_add(counter_ptr, STEAL_CHUNK)
 
 
 @triton.jit

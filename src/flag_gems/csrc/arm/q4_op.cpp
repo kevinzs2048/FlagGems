@@ -376,6 +376,64 @@ int32_t g128_prefill_subgroup_unroll() {
   return static_cast<int32_t>(parsed);
 }
 
+bool use_g128_stealing_prefill() {
+  const char* configured =
+      std::getenv("FLAGGEMS_ARM_Q4_G128_STEALING_PREFILL");
+  if (configured == nullptr) {
+    return false;
+  }
+  return std::strcmp(configured, "0") != 0 &&
+      std::strcmp(configured, "false") != 0 &&
+      std::strcmp(configured, "off") != 0;
+}
+
+int32_t g128_steal_chunk() {
+  const char* configured =
+      std::getenv("FLAGGEMS_ARM_Q4_G128_STEAL_CHUNK");
+  if (configured == nullptr) {
+    return 2;
+  }
+  char* end = nullptr;
+  const long parsed = std::strtol(configured, &end, 10);
+  TORCH_CHECK(end != configured && *end == '\0' &&
+                  (parsed == 1 || parsed == 2 || parsed == 4 ||
+                   parsed == 8 || parsed == 16 || parsed == 32),
+              "FLAGGEMS_ARM_Q4_G128_STEAL_CHUNK must be "
+              "1, 2, 4, 8, 16, or 32");
+  return static_cast<int32_t>(parsed);
+}
+
+class ScopedPrefillThreads {
+ public:
+  ScopedPrefillThreads() {
+    const char* configured = std::getenv("FLAGGEMS_Q4_PREFILL_THREADS");
+    if (configured == nullptr) {
+      return;
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(configured, &end, 10);
+    TORCH_CHECK(end != configured && *end == '\0' && parsed > 0 &&
+                    parsed <= 256,
+                "FLAGGEMS_Q4_PREFILL_THREADS must be in [1,256]");
+    previous_ = omp_get_max_threads();
+    omp_set_num_threads(static_cast<int>(parsed));
+    active_ = true;
+  }
+
+  ~ScopedPrefillThreads() {
+    if (active_) {
+      omp_set_num_threads(previous_);
+    }
+  }
+
+  ScopedPrefillThreads(const ScopedPrefillThreads&) = delete;
+  ScopedPrefillThreads& operator=(const ScopedPrefillThreads&) = delete;
+
+ private:
+  int previous_ = 0;
+  bool active_ = false;
+};
+
 void validate(const at::Tensor& input,
               const at::Tensor& rhs,
               int64_t n,
@@ -1561,6 +1619,9 @@ at::Tensor run_g128_prefill(const at::Tensor& input,
       Q4_KERNEL_SOURCE, "_pack_lhs_qai8dxp_asym_panel4_kernel");
   TritonJITFunction& matrix = TritonJITFunction::get_instance(
       Q4_KERNEL_SOURCE, "_q4_prefill_asym_g128_i8mm_kernel");
+  TritonJITFunction& matrix_stealing = TritonJITFunction::get_instance(
+      Q4_KERNEL_SOURCE,
+      "_q4_prefill_asym_g128_stealing_n_i8mm_kernel");
   TritonJITFunction& matrix_m12_k32 = TritonJITFunction::get_instance(
       Q4_KERNEL_SOURCE, "_q4_prefill_asym_g128_i8mm_kai_m12_k32_kernel");
   const int32_t m32 = checked_i32(m, "M");
@@ -1584,20 +1645,43 @@ at::Tensor run_g128_prefill(const at::Tensor& input,
   const int32_t main_rows = (m32 / block_m) * block_m;
   const int32_t main_tiles = main_rows / block_m;
   if (main_tiles > 0) {
-    matrix(nullptr,
-           static_cast<unsigned int>(main_tiles),
-           static_cast<unsigned int>(n32 / 4),
-           1,
-           1,
-           1,
-           lhs_blob,
-           rhs,
-           output,
-           n32,
-           k32,
-           block_m,
-           true,
-           g128_prefill_subgroup_unroll());
+    if (use_g128_stealing_prefill() && main_tiles > 1) {
+      const int32_t partitions = std::min<int32_t>(
+          std::max(1, omp_get_max_threads()), n32 / 4);
+      at::Tensor counter = at::zeros({1}, input.options().dtype(at::kInt));
+      matrix_stealing(nullptr,
+                      static_cast<unsigned int>(partitions),
+                      1,
+                      1,
+                      1,
+                      1,
+                      lhs_blob,
+                      rhs,
+                      output,
+                      counter,
+                      n32,
+                      k32,
+                      block_m,
+                      main_tiles,
+                      true,
+                      g128_prefill_subgroup_unroll(),
+                      g128_steal_chunk());
+    } else {
+      matrix(nullptr,
+             static_cast<unsigned int>(main_tiles),
+             static_cast<unsigned int>(n32 / 4),
+             1,
+             1,
+             1,
+             lhs_blob,
+             rhs,
+             output,
+             n32,
+             k32,
+             block_m,
+             true,
+             g128_prefill_subgroup_unroll());
+    }
   }
   const int32_t remaining = m32 - main_rows;
   if (remaining > 0) {
@@ -1644,8 +1728,11 @@ at::Tensor q4_linear_g128_cpu(const at::Tensor& input,
                               int64_t k) {
   validate_g128(input, rhs, n, k);
   const int64_t m = input.numel() / k;
-  return m < 4 ? run_g128_decode(input, rhs, n, k, m)
-               : run_g128_prefill(input, rhs, n, k, m);
+  if (m < 4) {
+    return run_g128_decode(input, rhs, n, k, m);
+  }
+  ScopedPrefillThreads threads;
+  return run_g128_prefill(input, rhs, n, k, m);
 }
 
 at::Tensor q4_linear_meta(const at::Tensor& input,
