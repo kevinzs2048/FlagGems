@@ -2,6 +2,7 @@ import multiprocessing
 import os
 import signal
 import sqlite3
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -16,6 +17,14 @@ from flag_gems.runtime import device, torch_device_fn
 from flag_gems.utils import libentry, libtuner
 from flag_gems.utils.code_cache import config_cache_dir
 from flag_gems.utils.libentry import libcache, major_version, minor_version
+
+
+def test_libentry_uses_platform_appropriate_lock():
+    if sys.platform == "darwin":
+        expected_lock_type = type(threading.Lock())
+    else:
+        expected_lock_type = type(multiprocessing.Lock())
+    assert type(softmax_kernel_inner.lock) is expected_lock_type
 
 
 # not_raises is copied from https://gist.github.com/oisinmulvihill/45c14271fad7794a4a52516ecb784e69
