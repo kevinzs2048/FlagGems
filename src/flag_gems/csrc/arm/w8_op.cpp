@@ -1,5 +1,6 @@
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
+#include <omp.h>
 #include <torch/library.h>
 
 #include <algorithm>
@@ -87,7 +88,8 @@ int32_t kai_decode_partitions(int64_t k, int64_t n) {
     return 1;
   }
   const int32_t threads = std::max(1, at::get_num_threads());
-  if (const char* configured = std::getenv("FLAGGEMS_W8_DECODE_PARTITIONS")) {
+  if (const char* configured =
+          std::getenv("FLAGGEMS_W8_DECODE_PARTITIONS")) {
     char* end = nullptr;
     const long parsed = std::strtol(configured, &end, 10);
     TORCH_CHECK(end != configured && *end == '\0' && parsed > 0,
@@ -108,6 +110,18 @@ bool use_kai_stealing_decode() {
   return std::strcmp(configured, "0") != 0 &&
       std::strcmp(configured, "false") != 0 &&
       std::strcmp(configured, "off") != 0;
+}
+
+int64_t kai_stealing_min_work() {
+  const char* configured = std::getenv("FLAGGEMS_W8_STEALING_MIN_WORK");
+  if (configured == nullptr) {
+    return 64 * 1024 * 1024;
+  }
+  char* end = nullptr;
+  const long long parsed = std::strtoll(configured, &end, 10);
+  TORCH_CHECK(end != configured && *end == '\0' && parsed >= 0,
+              "FLAGGEMS_W8_STEALING_MIN_WORK must be non-negative");
+  return static_cast<int64_t>(parsed);
 }
 
 // Kernel source paths are configured before the operator library is used and
@@ -162,17 +176,24 @@ TritonJITFunction& kai_prefill_m12_matrix() {
   return function;
 }
 
-int32_t kai_steal_chunk() {
-  const char* configured = std::getenv("FLAGGEMS_W8_STEAL_CHUNK");
+int32_t parse_steal_chunk(const char* variable, int32_t fallback) {
+  const char* configured = std::getenv(variable);
   if (configured == nullptr) {
-    return 64;
+    return fallback;
   }
   char* end = nullptr;
   const long parsed = std::strtol(configured, &end, 10);
   TORCH_CHECK(end != configured && *end == '\0' && parsed > 0 &&
                   parsed <= 1024,
-              "FLAGGEMS_W8_STEAL_CHUNK must be in [1,1024]");
+              variable, " must be in [1,1024]");
   return static_cast<int32_t>(parsed);
+}
+
+int32_t kai_decode_steal_chunk(int64_t work) {
+  if (work < 64 * 1024 * 1024) {
+    return parse_steal_chunk("FLAGGEMS_W8_BODY_STEAL_CHUNK", 8);
+  }
+  return parse_steal_chunk("FLAGGEMS_W8_STEAL_CHUNK", 64);
 }
 
 bool use_kai_stealing_prefill() {
@@ -197,6 +218,37 @@ int32_t kai_prefill_steal_chunk() {
               "FLAGGEMS_W8_PREFILL_STEAL_CHUNK must be in [1,32]");
   return static_cast<int32_t>(parsed);
 }
+
+class ScopedW8PrefillThreads {
+ public:
+  ScopedW8PrefillThreads() {
+    const char* configured = std::getenv("FLAGGEMS_W8_PREFILL_THREADS");
+    if (configured == nullptr) {
+      return;
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(configured, &end, 10);
+    TORCH_CHECK(end != configured && *end == '\0' && parsed > 0 &&
+                    parsed <= 256,
+                "FLAGGEMS_W8_PREFILL_THREADS must be in [1,256]");
+    previous_ = omp_get_max_threads();
+    omp_set_num_threads(static_cast<int>(parsed));
+    active_ = true;
+  }
+
+  ~ScopedW8PrefillThreads() {
+    if (active_) {
+      omp_set_num_threads(previous_);
+    }
+  }
+
+  ScopedW8PrefillThreads(const ScopedW8PrefillThreads&) = delete;
+  ScopedW8PrefillThreads& operator=(const ScopedW8PrefillThreads&) = delete;
+
+ private:
+  int previous_ = 0;
+  bool active_ = false;
+};
 
 at::Tensor run_decode(const at::Tensor& input,
                       const at::Tensor& decode_rhs,
@@ -349,29 +401,36 @@ at::Tensor run_kai_decode(const at::Tensor& input,
                           const at::Tensor& rhs,
                           int64_t n,
                           int64_t k) {
+  const int32_t n32 = checked_i32(n, "N");
+  const int32_t k32 = checked_i32(k, "K");
+  const int32_t partitions = kai_decode_partitions(k, n);
+  const int64_t work = k * n;
+  const bool stealing = use_kai_stealing_decode() &&
+      work >= kai_stealing_min_work() &&
+      partitions == at::get_num_threads();
   const int64_t lhs_bytes = k + 8;
   const int64_t output_bytes = n * input.element_size();
   // Keep the returned tensor at storage offset zero and place the short-lived
-  // activation pack on the next cache-line boundary in the same allocation.
+  // activation pack and optional work counter on cache-line boundaries in the
+  // same allocation. This avoids one allocator round-trip per stealing GEMV.
   const int64_t lhs_offset = 64 * ((output_bytes + 63) / 64);
+  const int64_t counter_offset =
+      64 * ((lhs_offset + lhs_bytes + 63) / 64);
+  const int64_t storage_bytes =
+      stealing ? counter_offset + 64 : lhs_offset + lhs_bytes;
   at::Tensor storage = at::empty(
-      {lhs_offset + lhs_bytes}, input.options().dtype(at::kByte));
+      {storage_bytes}, input.options().dtype(at::kByte));
   at::Tensor output = storage.narrow(0, 0, output_bytes)
                           .view(at::kBFloat16)
                           .view(output_shape(input, n));
   at::Tensor lhs =
       storage.narrow(0, lhs_offset, lhs_bytes).view(at::kChar);
   TritonJITFunction& pack = kai_decode_pack();
-  const int32_t n32 = checked_i32(n, "N");
-  const int32_t k32 = checked_i32(k, "K");
-  const int32_t partitions = kai_decode_partitions(k, n);
-  const bool stealing = use_kai_stealing_decode() &&
-      k * n >= 64 * 1024 * 1024 && partitions == at::get_num_threads();
   TritonJITFunction& matrix =
       stealing ? kai_decode_stealing_matrix() : kai_decode_matrix();
   pack(nullptr, 1, 1, 1, 1, 1, input, lhs, 1, k32, k32, 1);
   if (stealing) {
-    at::Tensor counter = at::empty({16}, input.options().dtype(at::kInt));
+    at::Tensor counter = storage.narrow(0, counter_offset, 64).view(at::kInt);
     *counter.data_ptr<int32_t>() = 0;
     matrix(nullptr,
            static_cast<unsigned int>(partitions),
@@ -388,7 +447,7 @@ at::Tensor run_kai_decode(const at::Tensor& input,
            k32,
            n32,
            2,
-           kai_steal_chunk());
+           kai_decode_steal_chunk(work));
   } else {
     matrix(nullptr,
            static_cast<unsigned int>(partitions),
@@ -419,6 +478,7 @@ at::Tensor run_kai_prefill(const at::Tensor& input,
                            int64_t n,
                            int64_t k,
                            int64_t m) {
+  ScopedW8PrefillThreads threads;
   const int32_t m32 = checked_i32(m, "M");
   const int32_t n32 = checked_i32(n, "N");
   const int32_t k32 = checked_i32(k, "K");

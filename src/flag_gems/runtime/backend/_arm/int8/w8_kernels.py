@@ -279,7 +279,9 @@ def _w8_qai8dxp_decode_stealing_sdot_kernel(
     output_lanes = tl.arange(0, 4)
     x_offsets = tl.arange(0, 8)
 
-    local_begin = range_begin + tl.atomic_add(counter_ptr, STEAL_CHUNK)
+    local_begin = range_begin + tl.atomic_add(
+        counter_ptr, STEAL_CHUNK, sem="relaxed"
+    )
     while local_begin < range_end:
         local_end = tl.minimum(local_begin + STEAL_CHUNK, range_end)
         for block in range(local_begin, local_end):
@@ -330,7 +332,9 @@ def _w8_qai8dxp_decode_stealing_sdot_kernel(
                 out_ptr + block * 4 + output_lanes,
                 result.to(tl.bfloat16),
             )
-        local_begin = range_begin + tl.atomic_add(counter_ptr, STEAL_CHUNK)
+        local_begin = range_begin + tl.atomic_add(
+            counter_ptr, STEAL_CHUNK, sem="relaxed"
+        )
 
 
 @triton.jit
