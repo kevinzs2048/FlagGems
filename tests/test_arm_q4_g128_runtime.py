@@ -1,5 +1,4 @@
 import copy
-import os
 import platform
 
 import pytest
@@ -7,19 +6,23 @@ import torch
 
 
 pytestmark = pytest.mark.skipif(
-    platform.system() != "Darwin" or platform.machine() != "arm64",
-    reason="requires the macOS Arm libtriton_jit runtime",
+    platform.machine().lower() not in {"arm64", "aarch64"},
+    reason="requires an AArch64 libtriton_jit runtime",
 )
 
 
-def test_g128_prefill_stealing_matches_regular_grid(monkeypatch):
-    runtime_library = os.getenv("FLAGGEMS_LIBTRITON_JIT_Q4_OP")
-    if not runtime_library or not os.path.isfile(runtime_library):
-        pytest.skip("FLAGGEMS_LIBTRITON_JIT_Q4_OP is not configured")
-
+def _load_arm_runtime() -> None:
     from flag_gems.csrc.arm import configure_runtime
 
-    torch.ops.load_library(os.path.realpath(configure_runtime()))
+    try:
+        runtime_library = configure_runtime()
+    except FileNotFoundError as error:
+        pytest.skip(str(error))
+    torch.ops.load_library(str(runtime_library.resolve()))
+
+
+def test_g128_prefill_stealing_matches_regular_grid(monkeypatch):
+    _load_arm_runtime()
     torch.manual_seed(42)
     m, n, k = 32, 64, 128
     x = torch.randn((m, k), dtype=torch.bfloat16)
@@ -46,13 +49,7 @@ def test_g128_prefill_stealing_matches_regular_grid(monkeypatch):
 
 
 def test_g128_decode_is_repeatable():
-    runtime_library = os.getenv("FLAGGEMS_LIBTRITON_JIT_Q4_OP")
-    if not runtime_library or not os.path.isfile(runtime_library):
-        pytest.skip("FLAGGEMS_LIBTRITON_JIT_Q4_OP is not configured")
-
-    from flag_gems.csrc.arm import configure_runtime
-
-    torch.ops.load_library(os.path.realpath(configure_runtime()))
+    _load_arm_runtime()
     torch.manual_seed(43)
     n, k = 64, 128
     x = torch.randn((1, k), dtype=torch.bfloat16)
@@ -73,16 +70,11 @@ def test_g128_decode_is_repeatable():
 
 
 def test_prefill_thread_override_is_scoped_across_q4_routes(monkeypatch):
-    runtime_library = os.getenv("FLAGGEMS_LIBTRITON_JIT_Q4_OP")
-    if not runtime_library or not os.path.isfile(runtime_library):
-        pytest.skip("FLAGGEMS_LIBTRITON_JIT_Q4_OP is not configured")
-
-    from flag_gems.csrc.arm import configure_runtime
     from flag_gems.runtime.backend._arm.q4.linear import (
         pack_rhs_qsi4c32p_asym_compact,
     )
 
-    torch.ops.load_library(os.path.realpath(configure_runtime()))
+    _load_arm_runtime()
     torch.manual_seed(44)
     m, n, k = 4, 1024, 128
     quantized = torch.randint(-8, 8, (n, k), dtype=torch.int8)
@@ -102,12 +94,8 @@ def test_prefill_thread_override_is_scoped_across_q4_routes(monkeypatch):
 
 
 def test_g128_vllm_fast_apply_preserves_parameter_identity_on_deepcopy():
-    runtime_library = os.getenv("FLAGGEMS_LIBTRITON_JIT_Q4_OP")
-    if not runtime_library or not os.path.isfile(runtime_library):
-        pytest.skip("FLAGGEMS_LIBTRITON_JIT_Q4_OP is not configured")
     pytest.importorskip("vllm")
 
-    from flag_gems.csrc.arm import configure_runtime
     from flag_gems.runtime.backend._arm.q4 import linear
     from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
         MPLinearLayerConfig,
@@ -117,7 +105,7 @@ def test_g128_vllm_fast_apply_preserves_parameter_identity_on_deepcopy():
     )
     from vllm.scalar_type import scalar_types
 
-    torch.ops.load_library(os.path.realpath(configure_runtime()))
+    _load_arm_runtime()
     linear._enable_vllm_dynamic4bit_g128()
     previous = linear.set_vllm_fast_apply_enabled(True)
     try:
