@@ -2462,7 +2462,7 @@ def _enable_vllm_dynamic4bit_g128() -> None:
         # Store only serializable data on the kernel object.  The previous
         # function-valued shortcut made Torch AOT deepcopy fail.
         if _USE_VLLM_FAST_APPLY:
-            self._flag_gems_q4_prepared_rhs = rhs
+            self._flag_gems_q4_prepared_rhs = getattr(layer, self.w_q_name)
         setattr(layer, self.w_s_name, None)
         if packed_checkpoint:
             setattr(layer, "weight_shape", None)
