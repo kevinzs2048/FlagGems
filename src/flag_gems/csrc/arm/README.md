@@ -45,6 +45,14 @@ single-token inputs.  The Arm runtime tests compare regular-grid and
 coarse-stripe outputs bit-for-bit before a deployment profile enables either
 prefill policy.
 
+W8 may use separate measured thread policies for the two phases.  Set
+`FLAGGEMS_W8_PREFILL_THREADS=<n>` to scope an OpenMP override to W8 prefill;
+the previous thread count is restored before returning to decode.  Dynamic
+N4 work distribution for W8 decode is controlled by
+`FLAGGEMS_W8_STEALING_DECODE`, `FLAGGEMS_W8_STEALING_MIN_WORK`, and
+`FLAGGEMS_W8_BODY_STEAL_CHUNK`.  The work counter uses relaxed atomic updates:
+it only assigns disjoint output tiles and does not publish tensor data.
+
 ## W8 dispatch hot path
 
 The exact-KAI W8 router retains its `TritonJITFunction` registry handles after
