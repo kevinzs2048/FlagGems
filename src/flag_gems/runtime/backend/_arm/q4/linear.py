@@ -59,7 +59,8 @@ _USE_COMPACT_G128_NORM = os.getenv(
     "FLAGGEMS_ARM_Q4_COMPACT_G128_NORM", "0"
 ).lower() in {"1", "true", "on"}
 _USE_VLLM_FAST_APPLY = os.getenv(
-    "FLAGGEMS_Q4_FAST_APPLY", "0"
+    "FLAGGEMS_VLLM_FAST_APPLY",
+    os.getenv("FLAGGEMS_Q4_FAST_APPLY", "0"),
 ).lower() in {"1", "true", "on"}
 _STATS = {
     "prepared_linears": 0,
@@ -102,7 +103,7 @@ def set_fused_decode_enabled(enabled: bool) -> bool:
 
 
 def set_vllm_fast_apply_enabled(enabled: bool) -> bool:
-    """Toggle the cached prepared-layer Q4 call path for same-engine A/B."""
+    """Toggle cached prepared-layer quantized calls for same-engine A/B."""
     global _USE_VLLM_FAST_APPLY
     previous = _USE_VLLM_FAST_APPLY
     _USE_VLLM_FAST_APPLY = bool(enabled)
@@ -2652,6 +2653,11 @@ def _enable_vllm_dynamic_int8() -> None:
             w_s_name,
             torch.nn.Parameter(scale.contiguous(), requires_grad=False),
         )
+        # Match the Q4 fast path: retain only serializable prepared data on
+        # the quant kernel so AOT deepcopy remains valid while hot calls avoid
+        # resolving the packed parameter through the layer on every linear.
+        if _USE_VLLM_FAST_APPLY:
+            self._flag_gems_w8_prepared_rhs = getattr(layer, w_q_name)
         self._flag_gems_libtriton_jit_w8_shape = (n, k)
         _STATS["prepared_w8_linears"] += 1
 
@@ -2661,7 +2667,21 @@ def _enable_vllm_dynamic_int8() -> None:
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        prepared_rhs = getattr(self, "_flag_gems_w8_prepared_rhs", None)
         shape = getattr(self, "_flag_gems_libtriton_jit_w8_shape", None)
+        if (
+            _USE_VLLM_FAST_APPLY
+            and prepared_rhs is not None
+            and shape is not None
+            and bias is None
+            and x.dtype == torch.bfloat16
+            and x.device.type == "cpu"
+            and x.is_contiguous()
+        ):
+            n, k = shape
+            return torch.ops.triton_jit_cpu.w8_linear_kai(
+                x, prepared_rhs, n, k
+            )
         if shape is None:
             return original_apply(self, layer, x, bias)
         n, k = shape

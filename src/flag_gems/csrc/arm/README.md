@@ -44,3 +44,21 @@ Decode is selected independently and continues to use the SDOT kernels for
 single-token inputs.  The Arm runtime tests compare regular-grid and
 coarse-stripe outputs bit-for-bit before a deployment profile enables either
 prefill policy.
+
+## W8 dispatch hot path
+
+The exact-KAI W8 router retains its `TritonJITFunction` registry handles after
+their first lookup.  Source paths are configured before the operator library
+is used, and libtriton_jit owns registry entries for the process lifetime; a
+linear therefore does not repeatedly format a key, lock the global registry,
+and search its map.  Decode also uses one allocator block for the temporary
+activation pack and returned BF16 output, with the output kept on a 64-byte
+boundary.  These are dispatch and storage-lifetime changes only: activation
+packing, SDOT/I8MM accumulation, and epilogues remain in the imported Triton
+programs.
+
+The vLLM Q4/W8 bindings can additionally retain each prepared RHS tensor on
+its quant-kernel object with `FLAGGEMS_VLLM_FAST_APPLY=1`.  This is a
+data-only attribute and remains compatible with vLLM AOT deepcopy while
+avoiding repeated layer parameter lookup and generic dtype/bias branches.  The
+older `FLAGGEMS_Q4_FAST_APPLY` name remains a fallback for existing profiles.
