@@ -1,5 +1,4 @@
 import copy
-import os
 import platform
 
 import pytest
@@ -7,9 +6,19 @@ import torch
 
 
 pytestmark = pytest.mark.skipif(
-    platform.system() != "Darwin" or platform.machine() != "arm64",
-    reason="requires the macOS Arm libtriton_jit runtime",
+    platform.machine().lower() not in {"arm64", "aarch64"},
+    reason="requires an AArch64 libtriton_jit runtime",
 )
+
+
+def _load_arm_runtime() -> None:
+    from flag_gems.csrc.arm import configure_runtime
+
+    try:
+        runtime_library = configure_runtime()
+    except FileNotFoundError as error:
+        pytest.skip(str(error))
+    torch.ops.load_library(str(runtime_library.resolve()))
 
 
 def _symmetric_w8_reference(
@@ -32,14 +41,9 @@ def _symmetric_w8_reference(
 
 
 def test_w8_prefill_stealing_matches_regular_grid(monkeypatch):
-    runtime_library = os.getenv("FLAGGEMS_LIBTRITON_JIT_Q4_OP")
-    if not runtime_library or not os.path.isfile(runtime_library):
-        pytest.skip("FLAGGEMS_LIBTRITON_JIT_Q4_OP is not configured")
-
-    from flag_gems.csrc.arm import configure_runtime
     from flag_gems.runtime.backend._arm.q4.linear import pack_rhs_w8_symmetric
 
-    torch.ops.load_library(os.path.realpath(configure_runtime()))
+    _load_arm_runtime()
     torch.manual_seed(42)
     m, n, k = 32, 64, 128
     x = torch.randn((m, k), dtype=torch.bfloat16)
@@ -61,15 +65,30 @@ def test_w8_prefill_stealing_matches_regular_grid(monkeypatch):
     torch.testing.assert_close(stealing, regular, rtol=0, atol=0)
 
 
-def test_w8_prefill_thread_override_is_scoped(monkeypatch):
-    runtime_library = os.getenv("FLAGGEMS_LIBTRITON_JIT_Q4_OP")
-    if not runtime_library or not os.path.isfile(runtime_library):
-        pytest.skip("FLAGGEMS_LIBTRITON_JIT_Q4_OP is not configured")
-
-    from flag_gems.csrc.arm import configure_runtime
+@pytest.mark.parametrize("m", [3, 9, 13, 17, 25, 33])
+def test_w8_compact_prefill_tails_match_reference(monkeypatch, m):
     from flag_gems.runtime.backend._arm.q4.linear import pack_rhs_w8_symmetric
 
-    torch.ops.load_library(os.path.realpath(configure_runtime()))
+    _load_arm_runtime()
+    torch.manual_seed(4200 + m)
+    n, k = 64, 128
+    x = torch.randn((m, k), dtype=torch.bfloat16)
+    weight = torch.randint(-127, 128, (n, k), dtype=torch.int8)
+    scale = 0.001 + 0.02 * torch.rand(n)
+    rhs = pack_rhs_w8_symmetric(weight, scale)
+
+    monkeypatch.setenv("FLAGGEMS_W8_STEALING_PREFILL", "1")
+    monkeypatch.setenv("FLAGGEMS_W8_PREFILL_STEAL_CHUNK", "2")
+    output = torch.ops.triton_jit_cpu.w8_linear_kai(x, rhs, n, k)
+
+    reference = _symmetric_w8_reference(x, weight, scale)
+    torch.testing.assert_close(output, reference, rtol=0.02, atol=0.125)
+
+
+def test_w8_prefill_thread_override_is_scoped(monkeypatch):
+    from flag_gems.runtime.backend._arm.q4.linear import pack_rhs_w8_symmetric
+
+    _load_arm_runtime()
     torch.manual_seed(46)
     m, n, k = 32, 64, 128
     x = torch.randn((m, k), dtype=torch.bfloat16)
@@ -84,14 +103,9 @@ def test_w8_prefill_thread_override_is_scoped(monkeypatch):
 
 
 def test_w8_decode_output_is_aligned_and_repeatable():
-    runtime_library = os.getenv("FLAGGEMS_LIBTRITON_JIT_Q4_OP")
-    if not runtime_library or not os.path.isfile(runtime_library):
-        pytest.skip("FLAGGEMS_LIBTRITON_JIT_Q4_OP is not configured")
-
-    from flag_gems.csrc.arm import configure_runtime
     from flag_gems.runtime.backend._arm.q4.linear import pack_rhs_w8_symmetric
 
-    torch.ops.load_library(os.path.realpath(configure_runtime()))
+    _load_arm_runtime()
     torch.manual_seed(43)
     n, k = 64, 128
     x = torch.randn((1, k), dtype=torch.bfloat16)
@@ -112,14 +126,9 @@ def test_w8_decode_output_is_aligned_and_repeatable():
 
 
 def test_w8_body_decode_stealing_matches_static_grid(monkeypatch):
-    runtime_library = os.getenv("FLAGGEMS_LIBTRITON_JIT_Q4_OP")
-    if not runtime_library or not os.path.isfile(runtime_library):
-        pytest.skip("FLAGGEMS_LIBTRITON_JIT_Q4_OP is not configured")
-
-    from flag_gems.csrc.arm import configure_runtime
     from flag_gems.runtime.backend._arm.q4.linear import pack_rhs_w8_symmetric
 
-    torch.ops.load_library(os.path.realpath(configure_runtime()))
+    _load_arm_runtime()
     torch.manual_seed(45)
     n, k = 1024, 2048
     x = torch.randn((1, k), dtype=torch.bfloat16)
@@ -145,12 +154,8 @@ def test_w8_body_decode_stealing_matches_static_grid(monkeypatch):
 
 
 def test_w8_vllm_fast_apply_is_data_only_and_exact():
-    runtime_library = os.getenv("FLAGGEMS_LIBTRITON_JIT_Q4_OP")
-    if not runtime_library or not os.path.isfile(runtime_library):
-        pytest.skip("FLAGGEMS_LIBTRITON_JIT_Q4_OP is not configured")
     pytest.importorskip("vllm")
 
-    from flag_gems.csrc.arm import configure_runtime
     from flag_gems.runtime.backend._arm.q4 import linear
     from vllm.model_executor.kernels.linear.scaled_mm import (
         Int8ScaledMMLinearLayerConfig,
@@ -159,7 +164,7 @@ def test_w8_vllm_fast_apply_is_data_only_and_exact():
         CPUInt8ScaledMMLinearKernel,
     )
 
-    torch.ops.load_library(os.path.realpath(configure_runtime()))
+    _load_arm_runtime()
     linear._enable_vllm_dynamic_int8()
     previous = linear.set_vllm_fast_apply_enabled(True)
     try:
