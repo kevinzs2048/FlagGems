@@ -62,3 +62,12 @@ its quant-kernel object with `FLAGGEMS_VLLM_FAST_APPLY=1`.  This is a
 data-only attribute and remains compatible with vLLM AOT deepcopy while
 avoiding repeated layer parameter lookup and generic dtype/bias branches.  The
 older `FLAGGEMS_Q4_FAST_APPLY` name remains a fallback for existing profiles.
+
+## W4 G128 dispatch hot path
+
+The G128 W4 router retains its `TritonJITFunction` registry handles after the
+first lookup. Source paths are configured before the operator library is used,
+and libtriton_jit owns registry entries for the process lifetime. Decode thus
+avoids repeatedly formatting a registry key, taking its global mutex, and
+searching the map. This changes dispatch only: asymmetric activation packing,
+SDOT/I8MM accumulation, and epilogues remain in the imported Triton programs.

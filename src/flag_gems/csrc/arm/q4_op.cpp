@@ -387,6 +387,61 @@ bool use_g128_stealing_prefill() {
       std::strcmp(configured, "off") != 0;
 }
 
+// Kernel source paths are configured before the operator library is used and
+// remain process-immutable. Retaining these registry handles removes a global
+// libtriton_jit registry lock from every G128 linear while all packing and
+// matrix work continues to execute in the imported Triton programs.
+TritonJITFunction& asym_decode_pack() {
+  static TritonJITFunction& function = TritonJITFunction::get_instance(
+      Q4_KERNEL_SOURCE, "_pack_lhs_qai8dxp_asym_decode_kai_kernel");
+  return function;
+}
+
+TritonJITFunction& g128_decode_shared_matrix() {
+  static TritonJITFunction& function = TritonJITFunction::get_instance(
+      Q4_KERNEL_SOURCE, "_q4_decode_asym_g128_kai_shared_sdot_kernel");
+  return function;
+}
+
+TritonJITFunction& g128_decode_matrix() {
+  static TritonJITFunction& function = TritonJITFunction::get_instance(
+      Q4_KERNEL_SOURCE, "_q4_fused_decode_asym_g128_kai_sdot_kernel");
+  return function;
+}
+
+TritonJITFunction& g128_decode_stealing_matrix() {
+  static TritonJITFunction& function = TritonJITFunction::get_instance(
+      Q4_KERNEL_SOURCE,
+      "_q4_fused_decode_asym_g128_stealing_kai_sdot_kernel");
+  return function;
+}
+
+TritonJITFunction& g128_prefill_pack() {
+  static TritonJITFunction& function = TritonJITFunction::get_instance(
+      Q4_KERNEL_SOURCE, "_pack_lhs_qai8dxp_asym_panel4_kernel");
+  return function;
+}
+
+TritonJITFunction& g128_prefill_matrix() {
+  static TritonJITFunction& function = TritonJITFunction::get_instance(
+      Q4_KERNEL_SOURCE, "_q4_prefill_asym_g128_i8mm_kernel");
+  return function;
+}
+
+TritonJITFunction& g128_prefill_stealing_matrix() {
+  static TritonJITFunction& function = TritonJITFunction::get_instance(
+      Q4_KERNEL_SOURCE,
+      "_q4_prefill_asym_g128_stealing_n_i8mm_kernel");
+  return function;
+}
+
+TritonJITFunction& g128_prefill_m12_matrix() {
+  static TritonJITFunction& function = TritonJITFunction::get_instance(
+      Q4_KERNEL_SOURCE,
+      "_q4_prefill_asym_g128_i8mm_kai_m12_k32_kernel");
+  return function;
+}
+
 int32_t g128_steal_chunk() {
   const char* configured =
       std::getenv("FLAGGEMS_ARM_Q4_G128_STEAL_CHUNK");
@@ -746,8 +801,7 @@ at::Tensor run_g32_asym_compact_decode(const at::Tensor& input,
       scratch_bytes / 2);
 
   if (shared_pack) {
-    TritonJITFunction& pack = TritonJITFunction::get_instance(
-        Q4_KERNEL_SOURCE, "_pack_lhs_qai8dxp_asym_decode_kai_kernel");
+    TritonJITFunction& pack = asym_decode_pack();
     pack(nullptr,
          static_cast<unsigned int>(m32),
          1,
@@ -1420,8 +1474,7 @@ at::Tensor q4_linear_g128_swiglu_cpu(const at::Tensor& joined,
            g128_decode_unroll(k, n),
            decode_steal_chunk());
   } else {
-    TritonJITFunction& matrix = TritonJITFunction::get_instance(
-        Q4_KERNEL_SOURCE, "_q4_decode_asym_g128_kai_shared_sdot_kernel");
+    TritonJITFunction& matrix = g128_decode_shared_matrix();
     matrix(nullptr,
            static_cast<unsigned int>(m32),
            static_cast<unsigned int>(partitions),
@@ -1477,8 +1530,7 @@ at::Tensor run_g128_decode(const at::Tensor& input,
     // Quantize the token once instead of repeating the same K-element scan in
     // every output partition.  Keep this behind the existing runtime switch:
     // the saved activation work must outweigh the extra launch at M < 4.
-    TritonJITFunction& pack = TritonJITFunction::get_instance(
-        Q4_KERNEL_SOURCE, "_pack_lhs_qai8dxp_asym_decode_kai_kernel");
+    TritonJITFunction& pack = asym_decode_pack();
     pack(nullptr,
          static_cast<unsigned int>(m32),
          1,
@@ -1489,8 +1541,7 @@ at::Tensor run_g128_decode(const at::Tensor& input,
          storage,
          k32,
          k32);
-    TritonJITFunction& matrix = TritonJITFunction::get_instance(
-        Q4_KERNEL_SOURCE, "_q4_decode_asym_g128_kai_shared_sdot_kernel");
+    TritonJITFunction& matrix = g128_decode_shared_matrix();
     matrix(nullptr,
            static_cast<unsigned int>(m32),
            static_cast<unsigned int>(partitions),
@@ -1511,9 +1562,7 @@ at::Tensor run_g128_decode(const at::Tensor& input,
           storage.data_ptr<at::BFloat16>());
       std::memset(storage_bytes + activation_scratch_bytes, 0,
                   kStealingCounterBytes);
-      TritonJITFunction& kernel = TritonJITFunction::get_instance(
-          Q4_KERNEL_SOURCE,
-          "_q4_fused_decode_asym_g128_stealing_kai_sdot_kernel");
+      TritonJITFunction& kernel = g128_decode_stealing_matrix();
       kernel(nullptr,
              static_cast<unsigned int>(m32),
              static_cast<unsigned int>(partitions),
@@ -1532,8 +1581,7 @@ at::Tensor run_g128_decode(const at::Tensor& input,
              unroll,
              decode_steal_chunk());
     } else {
-      TritonJITFunction& kernel = TritonJITFunction::get_instance(
-          Q4_KERNEL_SOURCE, "_q4_fused_decode_asym_g128_kai_sdot_kernel");
+      TritonJITFunction& kernel = g128_decode_matrix();
       kernel(nullptr,
              static_cast<unsigned int>(m32),
              static_cast<unsigned int>(partitions),
@@ -1615,15 +1663,10 @@ at::Tensor run_g128_prefill(const at::Tensor& input,
   at::Tensor lhs_blob = at::empty({lhs_bytes}, input.options().dtype(at::kByte));
   at::Tensor input_2d = input.view({m, k});
 
-  TritonJITFunction& pack = TritonJITFunction::get_instance(
-      Q4_KERNEL_SOURCE, "_pack_lhs_qai8dxp_asym_panel4_kernel");
-  TritonJITFunction& matrix = TritonJITFunction::get_instance(
-      Q4_KERNEL_SOURCE, "_q4_prefill_asym_g128_i8mm_kernel");
-  TritonJITFunction& matrix_stealing = TritonJITFunction::get_instance(
-      Q4_KERNEL_SOURCE,
-      "_q4_prefill_asym_g128_stealing_n_i8mm_kernel");
-  TritonJITFunction& matrix_m12_k32 = TritonJITFunction::get_instance(
-      Q4_KERNEL_SOURCE, "_q4_prefill_asym_g128_i8mm_kai_m12_k32_kernel");
+  TritonJITFunction& pack = g128_prefill_pack();
+  TritonJITFunction& matrix = g128_prefill_matrix();
+  TritonJITFunction& matrix_stealing = g128_prefill_stealing_matrix();
+  TritonJITFunction& matrix_m12_k32 = g128_prefill_m12_matrix();
   const int32_t m32 = checked_i32(m, "M");
   const int32_t n32 = checked_i32(n, "N");
   const int32_t k32 = checked_i32(k, "K");
