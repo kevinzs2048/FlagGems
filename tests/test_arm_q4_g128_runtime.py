@@ -69,3 +69,32 @@ def test_g128_decode_is_repeatable():
     second = torch.ops.triton_jit_cpu.q4_linear_g128(x, rhs, n, k)
 
     torch.testing.assert_close(second, first, rtol=0, atol=0)
+
+
+def test_prefill_thread_override_is_scoped_across_q4_routes(monkeypatch):
+    runtime_library = os.getenv("FLAGGEMS_LIBTRITON_JIT_Q4_OP")
+    if not runtime_library or not os.path.isfile(runtime_library):
+        pytest.skip("FLAGGEMS_LIBTRITON_JIT_Q4_OP is not configured")
+
+    from flag_gems.csrc.arm import configure_runtime
+    from flag_gems.runtime.backend._arm.q4.linear import (
+        pack_rhs_qsi4c32p_asym_compact,
+    )
+
+    torch.ops.load_library(os.path.realpath(configure_runtime()))
+    torch.manual_seed(44)
+    m, n, k = 4, 1024, 128
+    quantized = torch.randint(-8, 8, (n, k), dtype=torch.int8)
+    scale = 0.001 + 0.02 * torch.rand(n, k // 32)
+    rhs = pack_rhs_qsi4c32p_asym_compact(quantized, scale)
+    x = torch.randn((m, k), dtype=torch.bfloat16)
+    joined = torch.randn((m, 2 * k), dtype=torch.bfloat16)
+
+    monkeypatch.setenv("FLAGGEMS_Q4_PREFILL_THREADS", "2")
+    original_threads = torch.get_num_threads()
+    torch.ops.triton_jit_cpu.q4_linear_g32_asym_compact(x, rhs, n, k)
+    assert torch.get_num_threads() == original_threads
+    torch.ops.triton_jit_cpu.q4_linear_g32_asym_compact_swiglu(
+        joined, rhs, n, k
+    )
+    assert torch.get_num_threads() == original_threads

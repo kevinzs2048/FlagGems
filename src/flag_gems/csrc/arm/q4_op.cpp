@@ -460,7 +460,10 @@ int32_t g128_steal_chunk() {
 
 class ScopedPrefillThreads {
  public:
-  ScopedPrefillThreads() {
+  explicit ScopedPrefillThreads(bool enabled = true) {
+    if (!enabled) {
+      return;
+    }
     const char* configured = std::getenv("FLAGGEMS_Q4_PREFILL_THREADS");
     if (configured == nullptr) {
       return;
@@ -1132,32 +1135,8 @@ at::Tensor run_g32_asym_compact_prefill(const at::Tensor& input,
                                         int64_t m) {
   const int64_t padded_m = 4 * ((m + 3) / 4);
   at::Tensor output = at::empty({padded_m, n}, input.options());
-  int previous_threads = 0;
-  bool restore_threads = false;
-  if (n >= 1024) {
-    if (const char* configured =
-            std::getenv("FLAGGEMS_Q4_PREFILL_THREADS")) {
-      char* end = nullptr;
-      const long parsed = std::strtol(configured, &end, 10);
-      TORCH_CHECK(end != configured && *end == '\0' && parsed > 0 &&
-                      parsed <= 256,
-                  "FLAGGEMS_Q4_PREFILL_THREADS must be in [1,256]");
-      previous_threads = omp_get_max_threads();
-      omp_set_num_threads(static_cast<int>(parsed));
-      restore_threads = true;
-    }
-  }
-  try {
-    run_g32_asym_compact_prefill_into(input, rhs, n, k, m, output, n);
-  } catch (...) {
-    if (restore_threads) {
-      omp_set_num_threads(previous_threads);
-    }
-    throw;
-  }
-  if (restore_threads) {
-    omp_set_num_threads(previous_threads);
-  }
+  ScopedPrefillThreads threads(n >= 1024);
+  run_g32_asym_compact_prefill_into(input, rhs, n, k, m, output, n);
   return output.narrow(0, 0, m).view(output_shape(input, n));
 }
 
@@ -1228,42 +1207,21 @@ at::Tensor q4_linear_g32_asym_compact_swiglu_cpu(
         Q4_KERNEL_SOURCE, "_q4_pack_swiglu_asym_panel4_kai_kernel");
     const int32_t m32 = checked_i32(m, "M");
     const int32_t k32 = checked_i32(k, "K");
-    const int previous_threads = omp_get_max_threads();
-    bool restore_threads = false;
-    if (const char* configured =
-            std::getenv("FLAGGEMS_Q4_PREFILL_THREADS")) {
-      char* end = nullptr;
-      const long parsed = std::strtol(configured, &end, 10);
-      TORCH_CHECK(end != configured && *end == '\0' && parsed > 0 &&
-                      parsed <= 256,
-                  "FLAGGEMS_Q4_PREFILL_THREADS must be in [1,256]");
-      omp_set_num_threads(static_cast<int>(parsed));
-      restore_threads = true;
-    }
-    try {
-      pack(nullptr,
-           static_cast<unsigned int>(padded_m / 4),
-           1,
-           1,
-           1,
-           1,
-           joined.view({m, 2 * k}),
-           scratch,
-           lhs,
-           m32,
-           2 * k32,
-           k32);
-      run_g32_asym_compact_prefill_matrix(
-          lhs, rhs, n, k, m, output, n);
-    } catch (...) {
-      if (restore_threads) {
-        omp_set_num_threads(previous_threads);
-      }
-      throw;
-    }
-    if (restore_threads) {
-      omp_set_num_threads(previous_threads);
-    }
+    ScopedPrefillThreads threads;
+    pack(nullptr,
+         static_cast<unsigned int>(padded_m / 4),
+         1,
+         1,
+         1,
+         1,
+         joined.view({m, 2 * k}),
+         scratch,
+         lhs,
+         m32,
+         2 * k32,
+         k32);
+    run_g32_asym_compact_prefill_matrix(
+        lhs, rhs, n, k, m, output, n);
     return output.narrow(0, 0, m).view(output_shape(joined, n));
   }
 
