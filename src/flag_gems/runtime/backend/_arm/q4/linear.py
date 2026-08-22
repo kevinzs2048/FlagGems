@@ -2153,24 +2153,26 @@ def prepare_w8_weight(
     )
 
 
-def pack_rhs_qsi8cxp(
+def pack_rhs_w8_symmetric(
     quantized: torch.Tensor,
     scales: torch.Tensor,
 ) -> torch.Tensor:
-    """Pack per-channel W8 into KleidiAI's exact N4/K8 ``qsi8cxp`` ABI."""
+    """Pack symmetric per-channel W8 into a compact N4/K8 Triton ABI."""
     if quantized.dtype != torch.int8 or quantized.ndim != 2:
-        raise ValueError("qsi8cxp values must be an INT8 [N,K] tensor")
+        raise ValueError("compact W8 values must be an INT8 [N,K] tensor")
     if quantized.device.type != "cpu" or scales.device != quantized.device:
-        raise ValueError("qsi8cxp packing requires CPU tensors on one device")
+        raise ValueError("compact W8 packing requires CPU tensors on one device")
     n, k = quantized.shape
     if n <= 0 or k <= 0 or n % 4 or k % 32:
-        raise ValueError("qsi8cxp requires N%4=0 and K%32=0")
+        raise ValueError("compact W8 packing requires N%4=0 and K%32=0")
     scales = scales.reshape(-1).to(torch.float32)
     if scales.numel() != n or not torch.isfinite(scales).all():
-        raise ValueError("qsi8cxp requires one finite FP32 scale per output")
+        raise ValueError(
+            "compact W8 packing requires one finite FP32 scale per output"
+        )
 
-    panel_stride = 4 * k + 48
-    packed = torch.zeros(
+    panel_stride = 4 * k + 16
+    packed = torch.empty(
         (n // 4, panel_stride), dtype=torch.uint8, device=quantized.device
     )
     interleaved = (
@@ -2180,14 +2182,23 @@ def pack_rhs_qsi8cxp(
         .reshape(n // 4, 4 * k)
     )
     packed[:, : 4 * k].view(torch.int8).copy_(interleaved)
-    sums = quantized.to(torch.int32).sum(dim=1).reshape(n // 4, 4)
-    packed[:, 4 * k : 4 * k + 16].view(torch.int32).copy_(sums)
-    packed[:, 4 * k + 16 : 4 * k + 32].view(torch.float32).copy_(
+    packed[:, 4 * k :].view(torch.float32).copy_(
         scales.reshape(n // 4, 4)
     )
-    # Bias stays a runtime Linear argument. A zero field preserves the exact
-    # qsi8cxp ABI while avoiding a second matrix format for bias-free layers.
     return packed.view(torch.int8).reshape(-1).contiguous()
+
+
+def pack_rhs_qsi8cxp(
+    quantized: torch.Tensor,
+    scales: torch.Tensor,
+) -> torch.Tensor:
+    """Compatibility alias for the compact symmetric W8 packer.
+
+    The old implementation stored asymmetric correction metadata that was
+    incompatible with symmetric-input checkpoints.  Keep the exported name
+    so downstream callers do not break while routing it to the corrected ABI.
+    """
+    return pack_rhs_w8_symmetric(quantized, scales)
 
 
 def prepare_w8_weight_kai(
@@ -2195,18 +2206,20 @@ def prepare_w8_weight_kai(
     *,
     chunk_rows: int = 1024,
 ) -> torch.Tensor:
-    """Quantize floating-point W8 and pack the guide's exact KAI RHS ABI."""
+    """Quantize floating-point W8 into the compact symmetric N4/K8 ABI."""
     if weight.ndim != 2 or not weight.is_floating_point():
         raise ValueError("W8 weight must be a floating-point [N,K] tensor")
     if weight.device.type != "cpu":
         raise ValueError("ARM W8 weight preparation supports CPU tensors only")
     n, k = weight.shape
     if n <= 0 or k <= 0 or n % 4 or k % 32:
-        raise ValueError(f"exact-KAI W8 requires N%4=0 and K%32=0; got {(n, k)}")
+        raise ValueError(
+            f"compact W8 requires N%4=0 and K%32=0; got {(n, k)}"
+        )
     if chunk_rows <= 0 or chunk_rows % 4:
         raise ValueError("W8 chunk_rows must be a positive multiple of four")
 
-    panel_stride = 4 * k + 48
+    panel_stride = 4 * k + 16
     packed = torch.empty(
         (n // 4, panel_stride), dtype=torch.int8, device=weight.device
     )
@@ -2222,7 +2235,7 @@ def prepare_w8_weight_kai(
             .clamp_(-127, 127)
             .to(torch.int8)
         )
-        chunk = pack_rhs_qsi8cxp(quantized, scales).reshape(
+        chunk = pack_rhs_w8_symmetric(quantized, scales).reshape(
             (row_end - row_begin) // 4, panel_stride
         )
         packed[row_begin // 4 : row_end // 4].copy_(chunk)
@@ -2234,7 +2247,7 @@ def _make_vllm_w8_linear(
     n: int,
     k: int,
 ):
-    """Create a vLLM callable for exact ``qai8dxp x qsi8cxp`` W8."""
+    """Create a callable for symmetric dynamic-A8 x compact N4/K8 W8."""
     def cpu_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None):
         source_dtype = x.dtype
         x_bf16 = x if source_dtype == torch.bfloat16 else x.to(torch.bfloat16)
@@ -2629,6 +2642,7 @@ def _enable_vllm_dynamic_int8() -> None:
         eligible = (
             config.is_channelwise
             and not config.is_static_input_scheme
+            and config.input_symmetric
             and weight.ndim == 2
             and weight.dtype == torch.int8
             and weight.shape[0] % 4 == 0
@@ -2642,7 +2656,7 @@ def _enable_vllm_dynamic_int8() -> None:
         if scale.numel() != n:
             raise RuntimeError("unexpected vLLM W8 per-channel scale shape")
         weight_nk = weight.detach().contiguous()
-        rhs = pack_rhs_qsi8cxp(weight_nk, scale)
+        rhs = pack_rhs_w8_symmetric(weight_nk, scale)
         replace_parameter(
             layer,
             w_q_name,

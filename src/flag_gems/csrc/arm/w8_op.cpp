@@ -68,17 +68,17 @@ void validate_kai(const at::Tensor& input,
                   int64_t n,
                   int64_t k) {
   TORCH_CHECK(input.device().is_cpu() && rhs.device().is_cpu(),
-              "libtriton_jit exact-KAI W8 supports CPU tensors only");
+              "libtriton_jit compact W8 supports CPU tensors only");
   TORCH_CHECK(input.scalar_type() == at::kBFloat16 && input.is_contiguous(),
-              "exact-KAI W8 requires contiguous BF16 input");
+              "compact W8 requires contiguous BF16 input");
   TORCH_CHECK(rhs.scalar_type() == at::kChar && rhs.is_contiguous(),
-              "exact-KAI W8 RHS must be a contiguous INT8 blob");
+              "compact W8 RHS must be a contiguous INT8 blob");
   TORCH_CHECK(input.dim() > 0 && input.numel() > 0 && input.size(-1) == k,
-              "invalid exact-KAI W8 input shape");
+              "invalid compact W8 input shape");
   TORCH_CHECK(n > 0 && k > 0 && n % 4 == 0 && k % 32 == 0,
-              "exact-KAI W8 requires N%4=0 and K%32=0");
-  TORCH_CHECK(rhs.numel() == (n / 4) * (4 * k + 48),
-              "invalid qsi8cxp W8 RHS byte count");
+              "compact W8 requires N%4=0 and K%32=0");
+  TORCH_CHECK(rhs.numel() == (n / 4) * (4 * k + 16),
+              "invalid compact symmetric W8 RHS byte count");
   checked_i32(n, "N");
   checked_i32(k, "K");
 }
@@ -148,13 +148,13 @@ TritonJITFunction& kai_decode_stealing_matrix() {
 
 TritonJITFunction& kai_prefill_pack() {
   static TritonJITFunction& function = TritonJITFunction::get_instance(
-      W8_KERNEL_SOURCE, "_pack_lhs_qai8dxp_bf16_mr4_kernel");
+      W8_KERNEL_SOURCE, "_pack_lhs_w8_i8mm_kai_kernel");
   return function;
 }
 
 TritonJITFunction& kai_prefill_matrix() {
   static TritonJITFunction& function = TritonJITFunction::get_instance(
-      W8_KERNEL_SOURCE, "_w8_qai8dxp_prefill_i8mm_kernel");
+      W8_KERNEL_SOURCE, "_w8_prefill_i8mm_kai_kernel");
   return function;
 }
 
@@ -166,13 +166,13 @@ TritonJITFunction& kai_prefill_stealing_matrix() {
 
 TritonJITFunction& kai_prefill_short_tail_matrix() {
   static TritonJITFunction& function = TritonJITFunction::get_instance(
-      W8_KERNEL_SOURCE, "_w8_qai8dxp_prefill_short_tail_kernel");
+      W8_KERNEL_SOURCE, "_w8_prefill_i8mm_kai_short_tail_kernel");
   return function;
 }
 
 TritonJITFunction& kai_prefill_m12_matrix() {
   static TritonJITFunction& function = TritonJITFunction::get_instance(
-      W8_KERNEL_SOURCE, "_w8_qai8dxp_prefill_m12_kernel");
+      W8_KERNEL_SOURCE, "_w8_prefill_i8mm_kai_m12_kernel");
   return function;
 }
 
@@ -469,7 +469,7 @@ at::Tensor run_kai_decode(const at::Tensor& input,
 
 int32_t tail_block(int32_t rows) {
   TORCH_CHECK(rows > 0 && rows <= 16,
-              "exact-KAI W8 tail must contain 1..16 rows");
+              "compact W8 tail must contain 1..16 rows");
   return std::min<int32_t>(16, 4 * ((rows + 3) / 4));
 }
 
@@ -483,7 +483,7 @@ at::Tensor run_kai_prefill(const at::Tensor& input,
   const int32_t n32 = checked_i32(n, "N");
   const int32_t k32 = checked_i32(k, "K");
   const int32_t padded_m = 4 * ((m32 + 3) / 4);
-  const int64_t lhs_panel_stride = 4 * k + 32;
+  const int64_t lhs_panel_stride = 4 * k + 16;
   const int64_t lhs_bytes =
       (static_cast<int64_t>(padded_m) / 4) * lhs_panel_stride;
   at::Tensor lhs = at::empty({lhs_bytes}, input.options().dtype(at::kChar));
@@ -492,7 +492,7 @@ at::Tensor run_kai_prefill(const at::Tensor& input,
 
   TritonJITFunction& pack = kai_prefill_pack();
   pack(nullptr,
-       static_cast<unsigned int>(padded_m / 4),
+       static_cast<unsigned int>(padded_m),
        1,
        1,
        1,
@@ -501,7 +501,8 @@ at::Tensor run_kai_prefill(const at::Tensor& input,
        lhs,
        m32,
        k32,
-       k32);
+       k32,
+       m32 == padded_m);
 
   const int32_t main_rows = (m32 / 16) * 16;
   if (main_rows > 0) {

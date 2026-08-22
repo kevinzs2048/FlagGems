@@ -12,13 +12,32 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _symmetric_w8_reference(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    values = x.to(torch.float32)
+    absmax = values.abs().amax(dim=-1, keepdim=True).clamp_min(1.0e-8)
+    input_scale = absmax / 127.0
+    quantized = (
+        torch.round(values * (127.0 / absmax))
+        .clamp_(-127, 127)
+        .to(torch.float32)
+    )
+    accumulator = quantized @ weight.to(torch.float32).T
+    return (
+        accumulator * (input_scale * weight_scale.to(torch.float32)[None, :])
+    ).to(torch.bfloat16)
+
+
 def test_w8_prefill_stealing_matches_regular_grid(monkeypatch):
     runtime_library = os.getenv("FLAGGEMS_LIBTRITON_JIT_Q4_OP")
     if not runtime_library or not os.path.isfile(runtime_library):
         pytest.skip("FLAGGEMS_LIBTRITON_JIT_Q4_OP is not configured")
 
     from flag_gems.csrc.arm import configure_runtime
-    from flag_gems.runtime.backend._arm.q4.linear import pack_rhs_qsi8cxp
+    from flag_gems.runtime.backend._arm.q4.linear import pack_rhs_w8_symmetric
 
     torch.ops.load_library(os.path.realpath(configure_runtime()))
     torch.manual_seed(42)
@@ -26,7 +45,7 @@ def test_w8_prefill_stealing_matches_regular_grid(monkeypatch):
     x = torch.randn((m, k), dtype=torch.bfloat16)
     weight = torch.randint(-127, 128, (n, k), dtype=torch.int8)
     scale = 0.001 + 0.02 * torch.rand(n)
-    rhs = pack_rhs_qsi8cxp(weight, scale)
+    rhs = pack_rhs_w8_symmetric(weight, scale)
 
     monkeypatch.setenv("FLAGGEMS_W8_STEALING_PREFILL", "0")
     regular = torch.ops.triton_jit_cpu.w8_linear_kai(x, rhs, n, k)
@@ -34,6 +53,11 @@ def test_w8_prefill_stealing_matches_regular_grid(monkeypatch):
     monkeypatch.setenv("FLAGGEMS_W8_PREFILL_STEAL_CHUNK", "2")
     stealing = torch.ops.triton_jit_cpu.w8_linear_kai(x, rhs, n, k)
 
+    reference = _symmetric_w8_reference(x, weight, scale)
+    # RNE at exact half-way values may differ by one INT8 LSB between the
+    # generated Arm conversion and torch.round.  The scale and symmetric
+    # zero-point contract remain identical.
+    torch.testing.assert_close(regular, reference, rtol=0.02, atol=0.125)
     torch.testing.assert_close(stealing, regular, rtol=0, atol=0)
 
 
@@ -43,7 +67,7 @@ def test_w8_prefill_thread_override_is_scoped(monkeypatch):
         pytest.skip("FLAGGEMS_LIBTRITON_JIT_Q4_OP is not configured")
 
     from flag_gems.csrc.arm import configure_runtime
-    from flag_gems.runtime.backend._arm.q4.linear import pack_rhs_qsi8cxp
+    from flag_gems.runtime.backend._arm.q4.linear import pack_rhs_w8_symmetric
 
     torch.ops.load_library(os.path.realpath(configure_runtime()))
     torch.manual_seed(46)
@@ -51,7 +75,7 @@ def test_w8_prefill_thread_override_is_scoped(monkeypatch):
     x = torch.randn((m, k), dtype=torch.bfloat16)
     weight = torch.randint(-127, 128, (n, k), dtype=torch.int8)
     scale = 0.001 + 0.02 * torch.rand(n)
-    rhs = pack_rhs_qsi8cxp(weight, scale)
+    rhs = pack_rhs_w8_symmetric(weight, scale)
 
     monkeypatch.setenv("FLAGGEMS_W8_PREFILL_THREADS", "2")
     original_threads = torch.get_num_threads()
@@ -65,7 +89,7 @@ def test_w8_decode_output_is_aligned_and_repeatable():
         pytest.skip("FLAGGEMS_LIBTRITON_JIT_Q4_OP is not configured")
 
     from flag_gems.csrc.arm import configure_runtime
-    from flag_gems.runtime.backend._arm.q4.linear import pack_rhs_qsi8cxp
+    from flag_gems.runtime.backend._arm.q4.linear import pack_rhs_w8_symmetric
 
     torch.ops.load_library(os.path.realpath(configure_runtime()))
     torch.manual_seed(43)
@@ -73,7 +97,7 @@ def test_w8_decode_output_is_aligned_and_repeatable():
     x = torch.randn((1, k), dtype=torch.bfloat16)
     weight = torch.randint(-127, 128, (n, k), dtype=torch.int8)
     scale = 0.001 + 0.02 * torch.rand(n)
-    rhs = pack_rhs_qsi8cxp(weight, scale)
+    rhs = pack_rhs_w8_symmetric(weight, scale)
 
     first = torch.ops.triton_jit_cpu.w8_linear_kai(x, rhs, n, k)
     second = torch.ops.triton_jit_cpu.w8_linear_kai(x, rhs, n, k)
@@ -82,6 +106,8 @@ def test_w8_decode_output_is_aligned_and_repeatable():
     assert second.data_ptr() % 64 == 0
     assert first.storage_offset() == 0
     assert second.storage_offset() == 0
+    reference = _symmetric_w8_reference(x, weight, scale)
+    torch.testing.assert_close(first, reference, rtol=0.02, atol=0.125)
     torch.testing.assert_close(second, first, rtol=0, atol=0)
 
 
@@ -91,7 +117,7 @@ def test_w8_body_decode_stealing_matches_static_grid(monkeypatch):
         pytest.skip("FLAGGEMS_LIBTRITON_JIT_Q4_OP is not configured")
 
     from flag_gems.csrc.arm import configure_runtime
-    from flag_gems.runtime.backend._arm.q4.linear import pack_rhs_qsi8cxp
+    from flag_gems.runtime.backend._arm.q4.linear import pack_rhs_w8_symmetric
 
     torch.ops.load_library(os.path.realpath(configure_runtime()))
     torch.manual_seed(45)
@@ -99,7 +125,7 @@ def test_w8_body_decode_stealing_matches_static_grid(monkeypatch):
     x = torch.randn((1, k), dtype=torch.bfloat16)
     weight = torch.randint(-127, 128, (n, k), dtype=torch.int8)
     scale = 0.001 + 0.02 * torch.rand(n)
-    rhs = pack_rhs_qsi8cxp(weight, scale)
+    rhs = pack_rhs_w8_symmetric(weight, scale)
 
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(2)
@@ -137,7 +163,7 @@ def test_w8_vllm_fast_apply_is_data_only_and_exact():
     linear._enable_vllm_dynamic_int8()
     previous = linear.set_vllm_fast_apply_enabled(True)
     try:
-        config = Int8ScaledMMLinearLayerConfig(False, True, False)
+        config = Int8ScaledMMLinearLayerConfig(False, True, True)
         names = (
             "weight",
             "weight_scale",
