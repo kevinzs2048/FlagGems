@@ -97,6 +97,14 @@ class DeviceDetector:
                 prop = torch_module.cuda.get_device_properties(0)
                 if "NVIDIA" in prop.name.upper():
                     return "nvidia"
+                # AMD's ROCm build intentionally exposes torch.cuda as its
+                # device API.  torch.version.hip is the reliable discriminator
+                # and works even when rocm-smi is not installed.
+                if (
+                    getattr(torch_module.version, "hip", None)
+                    and torch_module.cuda.is_available()
+                ):
+                    return "amd"
             except Exception:
                 return False
 

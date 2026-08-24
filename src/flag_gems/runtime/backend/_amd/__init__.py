@@ -17,7 +17,9 @@ from backend_utils import VendorDescriptor
 vendor_info = VendorDescriptor(
     vendor_name="amd",
     device_name="cuda",
-    device_query_cmd="rocm-smi",
+    # ROCm PyTorch exposes the device through the CUDA-compatible torch API;
+    # keep discovery independent of the optional rocm-smi utility.
+    device_query_cmd="",
 )
 
 """

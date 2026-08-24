@@ -1,0 +1,15 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Initial AMD bring-up allowlist.  These operators cover the numerically
+# stable Transformer primitives used by the Qwen3 smoke test.  More aggressive
+# fused attention/rotary paths remain opt-in until gfx1150 correctness is
+# established.  bmm uses event-based autotuning on AMD to avoid ROCm graph
+# replay issues during longer autoregressive decode on gfx1150.
+
+include:
+- rms_norm
+- softmax
+- mm
+- addmm
+- bmm
+- silu

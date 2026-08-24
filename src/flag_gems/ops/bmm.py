@@ -25,6 +25,12 @@ from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
 
+# HIP's CUDAGraph replay benchmarker can emit malformed AQL packets on
+# gfx1150 while autotuning the variable-shape bmm used by autoregressive
+# attention.  Event timing keeps the AMD path on the same kernel search while
+# avoiding graph capture/replay during tuning.
+_BMM_BENCHMARK_MODE = "event" if runtime.device.vendor_name == "amd" else None
+
 
 @libentry()
 @libtuner(
@@ -37,6 +43,7 @@ logger = logging.getLogger(__name__)
         "align32",
         "align32",
     ],
+    benchmark_mode=_BMM_BENCHMARK_MODE,
     flagtune_op_name="bmm",
     flagtune_expand_op_name="bmm",
     flagtune_pre_hook=None,
