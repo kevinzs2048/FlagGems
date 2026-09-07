@@ -5,6 +5,7 @@ import inspect
 import logging
 import math
 import os
+import sys
 import threading
 import time
 from abc import abstractmethod
@@ -742,12 +743,13 @@ class LibEntry(triton.KernelInterface):
             for p in self.jit_function.params
             if not p.is_constexpr and p.do_not_specialize
         ]
-        # ``kernel_cache`` and Triton's runtime are both process-local.  A
-        # process-shared semaphore cannot protect cache state in another
-        # interpreter and needlessly consumes one OS semaphore per decorated
-        # kernel (a finite resource on macOS).  We only need to serialize JIT
-        # compilation between threads in this interpreter.
-        self.lock = threading.Lock()
+        if sys.platform == "darwin":
+            # A process-shared semaphore consumes one file descriptor per
+            # decorated kernel and can exhaust macOS's low default limit. The
+            # cache is process-local, so only threads need serialization here.
+            self.lock = threading.Lock()
+        else:
+            self.lock = multiprocessing.Lock()
         self.signature = fn.signature
 
     @staticmethod
