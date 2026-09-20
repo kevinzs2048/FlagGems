@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <algorithm>
 #include <memory>
+#include <thread>
 #include "kai/ukernels/matmul/pack/kai_rhs_pack_nxk_qsi8cxp_qsi8cx_neon.h"
 #include "kai/ukernels/matmul/pack/kai_lhs_quant_pack_qai8dxp_f32.h"
 #include "kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi8cxp/kai_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme2_mopa.h"
@@ -204,7 +205,7 @@ at::Tensor run_hybrid(const at::Tensor& lhs,const at::Tensor& neon_lhs,
 // prevents a consumer from reading a panel before all its columns are written.
 at::Tensor run_wavefront(const at::Tensor& lhs,const at::Tensor& gate,const at::Tensor& up,
     const at::Tensor& down,const at::Tensor& table,int64_t m,int64_t n,int64_t k,int64_t d,
-    int64_t workers,const at::Tensor& clusters,int64_t mt,int64_t nt,int64_t dt) {
+    int64_t workers,const at::Tensor& clusters,int64_t mt,int64_t nt,int64_t dt,bool drain_tail) {
   TORCH_CHECK(m>=0 && n>0 && d>0 && k>0 && k%8==0 && k<=32768 &&
               workers>0 && workers<=at::get_num_threads(),"Invalid wavefront dimensions/workers");
   const int64_t mr=BG(get_mr)(),nr=BG(get_nr)(),kp=divup(n,2)*2;
@@ -272,7 +273,14 @@ at::Tensor run_wavefront(const at::Tensor& lhs,const at::Tensor& gate,const at::
           }
         }
         task=next_up.fetch_add(1,std::memory_order_relaxed);
-        if(task>=rows*cols)break;
+        if(task>=rows*cols) {
+          if(!drain_tail)break;
+          // Keep the team available to consume the final panels. A producer
+          // may still be writing them; next_down reaching its limit is the
+          // termination condition. Yield instead of spinning on cluster claims.
+          std::this_thread::yield();
+          continue;
+        }
         const int64_t block=task/cols,row=block*mt,col=task%cols*nt;
         const int64_t height=std::min(mt,m-row),width=std::min(nt,n-col);
         const auto* x=lhs.const_data_ptr<uint8_t>()+NG(get_lhs_packed_offset)(row,k);
@@ -295,5 +303,5 @@ at::Tensor run_wavefront(const at::Tensor& lhs,const at::Tensor& gate,const at::
 TORCH_LIBRARY(qwen21_w8_swiglu,m) {
   m.def("run(Tensor lhs, Tensor gate, Tensor up, Tensor table, int m, int n, int k, int workers, int mt=64, int nt=256) -> Tensor",&run);
   m.def("run_hybrid(Tensor lhs, Tensor neon_lhs, Tensor gate_sme, Tensor up_sme, Tensor gate_neon, Tensor up_neon, Tensor table, int m, int ns, int nn, int k, int workers, Tensor clusters, int smt=64, int snt=256, int nmt=128, int nnt=128) -> Tensor",&run_hybrid);
-  m.def("run_wavefront(Tensor lhs, Tensor gate, Tensor up, Tensor down, Tensor table, int m, int n, int k, int d, int workers, Tensor clusters, int mt=64, int nt=128, int dt=256) -> Tensor",&run_wavefront);
+  m.def("run_wavefront(Tensor lhs, Tensor gate, Tensor up, Tensor down, Tensor table, int m, int n, int k, int d, int workers, Tensor clusters, int mt=64, int nt=128, int dt=256, bool drain_tail=False) -> Tensor",&run_wavefront);
 }

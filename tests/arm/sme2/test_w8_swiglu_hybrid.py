@@ -150,7 +150,8 @@ def test_projection_pack_cache_invalidates_on_updates():
 )
 @pytest.mark.parametrize("workers", [1, 4])
 @torch.inference_mode()
-def test_wavefront_readiness_and_bf16_output(m, n, k, d, workers):
+@pytest.mark.parametrize("drain_tail", [False, True])
+def test_wavefront_readiness_and_bf16_output(m, n, k, d, workers, drain_tail):
     torch.set_num_threads(4)
     torch.manual_seed(922)
     w8, bf16, fused = ops(), bf16_ops(), load_ops("w8_swiglu")
@@ -169,6 +170,19 @@ def test_wavefront_readiness_and_bf16_output(m, n, k, d, workers):
     ]:
         for _ in range(3):
             actual = fused.run_wavefront(
-                nl, *neon, down, silu_table(), m, n, k, d, workers, mapping, 32, 64, 128
+                nl,
+                *neon,
+                down,
+                silu_table(),
+                m,
+                n,
+                k,
+                d,
+                workers,
+                mapping,
+                32,
+                64,
+                128,
+                drain_tail,
             )
             assert torch.equal(actual, expected)
