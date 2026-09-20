@@ -2,7 +2,7 @@
 
 This example runs Qwen-Image-2.1 on **PyTorch CPU**, with FlagGems-owned native
 SME2/KleidiAI operators. The validated profile quantizes 112 Transformer Linear
-modules to W8A8; other weights remain BF16. It requires no Torch-FL runtime or
+modules to W8A8; remaining Transformer weights stay BF16. It requires no Torch-FL runtime or
 `flagos` device registration.
 
 ## Files and ownership
@@ -52,8 +52,10 @@ From this directory:
   --output result.png
 ```
 
-`--model` is one complete pipeline directory: W8 Transformer plus BF16 Text
-Encoder/VAE, processor, scheduler and model_index.json. The checkpoint contract
+`--model` is one complete pipeline directory: mixed W8/BF16 Transformer plus
+unquantized Text Encoder/VAE, processor, scheduler and model_index.json.
+Unquantized files retain their source dtype: the September 20 VAE is FP32 on
+disk and is loaded as BF16 by the inference pipeline. The checkpoint contract
 is symmetric per-output-channel INT8 weights with FP32 scales and dynamic
 asymmetric per-token INT8 activations. The loader requires the same112 policy.
 For release packaging, include actual component files; developer symlinks back
@@ -112,6 +114,8 @@ Model weights, native build caches and the reference archive are not committed.
 
 ## Validation reports
 
+- [W8A8 export policy and numerical validation](QUANTIZATION.md)
+- [September 20 weights: quantization and image regression](QUANTIZATION_0920_REPORT.md)
 - [Integration, image parity and end-to-end timing](INTEGRATION_REPORT.md)
 - [stable-diffusion.cpp compatibility probe](STABLE_DIFFUSION_CPP_REVIEW.md)
 - [Plain PyTorch CPU baseline: reproduction](TORCH_BASELINE.md)
