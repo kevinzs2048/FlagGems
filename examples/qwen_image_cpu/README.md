@@ -1,5 +1,9 @@
 # Qwen-Image-2.1 W8A8 — PyTorch CPU inference on Mac
 
+For the English Mac-only model card and end-user inference commands, see
+[MODEL_CARD_MAC.md](MODEL_CARD_MAC.md). That document is also copied to the
+exported model directory as `README.md`.
+
 This example runs Qwen-Image-2.1 on **PyTorch CPU**, with FlagGems-owned native
 SME2/KleidiAI operators. The validated profile quantizes 112 Transformer Linear
 modules to W8A8; remaining Transformer weights stay BF16. It requires no Torch-FL runtime or
