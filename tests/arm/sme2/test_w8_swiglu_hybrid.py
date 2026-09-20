@@ -67,7 +67,7 @@ def test_hybrid_packed_swiglu_and_consumer(m, n, k, split, workers):
                 64,
                 256,
                 32,
-                64
+                64,
             )
             assert torch.equal(actual, expected)
         rhs = bf16.pack_direct(torch.randn(17, n).bfloat16())
@@ -136,3 +136,39 @@ def test_projection_pack_cache_invalidates_on_updates():
     for fraction in (0, 1, float("nan"), 0.01):
         with pytest.raises(ValueError):
             prepare_weights(*layers, fraction)
+
+
+@pytest.mark.parametrize(
+    "m,n,k,d",
+    [
+        (0, 129, 32, 17),
+        (1, 129, 8, 17),
+        (37, 257, 264, 71),
+        (129, 513, 256, 129),
+        (128, 1024, 4096, 256),
+    ],
+)
+@pytest.mark.parametrize("workers", [1, 4])
+@torch.inference_mode()
+def test_wavefront_readiness_and_bf16_output(m, n, k, d, workers):
+    torch.set_num_threads(4)
+    torch.manual_seed(922)
+    w8, bf16, fused = ops(), bf16_ops(), load_ops("w8_swiglu")
+    x = torch.randn(m, k).bfloat16()
+    weights = [quantize_weight(torch.randn(n, k).bfloat16()) for _ in range(2)]
+    full = [w8.pack(*w) for w in weights]
+    neon = [w8.pack_neon(*w) for w in weights]
+    lhs = w8.quant_pack_bf16(x)
+    nl = w8.repack_neon_lhs(lhs, m, k)
+    packed = fused.run(lhs, *full, silu_table(), m, n, k, 4, 64, 256)
+    down = bf16.pack_direct(torch.randn(d, n).bfloat16())
+    expected = matrix_ops().matmul(packed, down, m, d, n, 4, 32, 256, 2, 0).bfloat16()
+    for mapping in [
+        torch.zeros(os.cpu_count(), dtype=torch.long),
+        torch.arange(os.cpu_count()) // 6,
+    ]:
+        for _ in range(3):
+            actual = fused.run_wavefront(
+                nl, *neon, down, silu_table(), m, n, k, d, workers, mapping, 32, 64, 128
+            )
+            assert torch.equal(actual, expected)

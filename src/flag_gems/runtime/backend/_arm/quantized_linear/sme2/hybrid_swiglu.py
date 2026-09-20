@@ -7,6 +7,17 @@ import torch
 from .w8a8_sme import ops
 
 
+def _key(t):
+    return (
+        id(t),
+        t.data_ptr(),
+        None if t.is_inference() else t._version,
+        tuple(t.shape),
+        t.dtype,
+        t.device,
+    )
+
+
 @torch.no_grad()
 def prepare_weights(gate, up, fraction):
     """Pack canonical W8 projections; inference tensors must remain immutable.
@@ -24,17 +35,7 @@ def prepare_weights(gate, up, fraction):
     if not 0 < split < n:
         raise ValueError("Both aligned weight partitions must be nonempty")
 
-    def key(t):
-        return (
-            id(t),
-            t.data_ptr(),
-            None if t.is_inference() else t._version,
-            tuple(t.shape),
-            t.dtype,
-            t.device,
-        )
-
-    version = tuple(key(t) for t in tensors)
+    version = tuple(_key(t) for t in tensors)
     cached = getattr(gate, "_hybrid_swiglu_weights", None)
     if cached is None or cached[0] != version:
         cached = (version, {})
@@ -46,3 +47,20 @@ def prepare_weights(gate, up, fraction):
         neon = [w8.pack_neon(q[split:], s[split:]) for q, s in weights]
         cached[1][split] = (split, *sme, *neon)
     return cached[1][split]
+
+
+@torch.no_grad()
+def prepare_neon_pair(gate, up):
+    """Full NEON projections for a W8/BF16 row pipeline; no requantization."""
+    if gate.weight_codes.shape != up.weight_codes.shape:
+        raise ValueError("SwiGLU projection shapes must match")
+    tensors = (gate.weight_codes, gate.weight_scale, up.weight_codes, up.weight_scale)
+    version = tuple(_key(t) for t in tensors)
+    cached = getattr(gate, "_wavefront_swiglu_weights", None)
+    if cached is None or cached[0] != version:
+        cached = (
+            version,
+            tuple(ops().pack_neon(p.weight_codes, p.weight_scale) for p in (gate, up)),
+        )
+        gate._wavefront_swiglu_weights = cached
+    return cached[1]
