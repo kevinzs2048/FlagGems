@@ -69,3 +69,5 @@ global optimum. The selected configuration then runs every complete request.
 
 The separate optimized production baseline remains unchanged. Completed
 40-step measurements and their scope are in `INTEGRATION_REPORT.md`.
+The plain PyTorch measurements and image checks are in
+[TORCH_BASELINE_RESULTS.md](TORCH_BASELINE_RESULTS.md).

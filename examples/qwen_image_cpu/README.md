@@ -114,3 +114,5 @@ Model weights, native build caches and the reference archive are not committed.
 
 - [Integration, image parity and end-to-end timing](INTEGRATION_REPORT.md)
 - [stable-diffusion.cpp compatibility probe](STABLE_DIFFUSION_CPP_REVIEW.md)
+- [Plain PyTorch CPU baseline: reproduction](TORCH_BASELINE.md)
+- [Plain PyTorch CPU baseline: complete 40-step measurements](TORCH_BASELINE_RESULTS.md)
