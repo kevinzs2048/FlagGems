@@ -123,8 +123,10 @@ def load(model, storage):
     pipe = reference.QwenImage21Pipeline.from_pretrained(
         model, torch_dtype=torch.bfloat16, local_files_only=True
     ).to("cpu")
-    reference.prepare_cpu_pipeline(pipe)
+    # Replace Linear before installing bound-method adapters. Otherwise the old
+    # BF16 modules can remain in Python reference cycles until cyclic GC runs.
     promoted = promote_linears(pipe.transformer) if storage == "promote" else 0
+    reference.prepare_cpu_pipeline(pipe)
     if storage == "transient":
         for layer in pipe.transformer.modules():
             if getattr(layer, "_fp32_accumulation_enabled", False):
