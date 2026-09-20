@@ -109,3 +109,8 @@ Python model-specific fusion wiring lives in this repository's example package.
 Only `run.sh` is a shell launcher. Optional exploration modules are retained
 for numerical regression; their presence does not enable them in production.
 Model weights, native build caches and the reference archive are not committed.
+
+## Validation reports
+
+- [Integration, image parity and end-to-end timing](INTEGRATION_REPORT.md)
+- [stable-diffusion.cpp compatibility probe](STABLE_DIFFUSION_CPP_REVIEW.md)
