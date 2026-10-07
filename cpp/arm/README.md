@@ -58,11 +58,24 @@ The chain is a compiled `@triton.jit` entry, CPU `raw_call`, then C++/Neon/KAI.
 It is a CPU native-call API, not source-region embedding. Warmup retains each
 compiled DSO and registers its compute address once. C++ calls that address
 synchronously; inference does not use a Python Triton launcher, per-expert
-lookup, or per-call JIT lookup. Small dense GEMMs have typed operation entries;
-composite MoE/GDN operations cross the boundary once per complete operation.
+lookup, or per-call JIT lookup. Dense host wrappers validate and allocate tensors before entering either the
+native or Raw computation. Both entries execute the same C ABI computation
+plan containing pointers, shapes and KAI kernels; no Tensor return value or
+ownership transfer crosses this boundary. Each call includes A8 packing and
+all GEMM tiles. Composite MoE/GDN operations cross the boundary once per
+complete operation.
 The C ABI catches C++ exceptions and the Torch caller rethrows them after the
 compiled entry returns. Tensor references and descriptors stay alive until
-all parallel work completes.
+all parallel work completes. The compiled dense entry symbols and native
+library are an internal matched ABI: rebuild the library and restart the
+process when updating this implementation.
+
+Neon-only single-row G32 calls pack A8 before the OpenMP fork, avoiding a
+packing worksharing loop and barrier with only one useful iteration. Equal
+128-column tiles with at most 32 rows use contiguous per-worker ownership
+based on the actual OpenMP team size. Mixed SME2/Neon and partial-tile work
+retain dynamic scheduling. Other noncanonical G32 packing paths synchronize
+once after writing their disjoint LHS regions.
 
 Linear inputs are contiguous FP32 `[M,K]`; W4 G32 scales are BF16, W8 scales
 are FP32. `linear_a8` consumes canonical rows rather than requantizing them.
@@ -155,9 +168,11 @@ model integration must also verify its complete prefill/decode path.
 
 These are opt-in candidate APIs. Functional coverage does not imply that every
 shape or platform meets the performance gate. The latest Darwin test run has
-61 passing cases. The last Linux AArch64 run before adding the decode wrapper
-has 36 passing cases and 9 SME2 cases skipped on unsupported hardware. The
-decode wrapper and its additional cases still require Linux revalidation.
+72 passing cases, including an unequal number of Neon tiles per worker and
+127/512-row packing coverage. The last Linux AArch64 run before adding the
+decode wrapper has 36 passing cases and 9 SME2 cases skipped on unsupported
+hardware. The decode wrapper, dense computation-plan refactor and expanded
+tests still require Linux revalidation.
 
 Paired Darwin public-entry measurements of width-four BF16 decode convolution
 at batch 1 (including cached metadata and Python transposes) give:
@@ -175,11 +190,33 @@ from -0.04% to +0.33%. Other tested K values and empty rows have correctness
 coverage. Public Python-entry savings also include loader overhead differences
 and must not be described as improvements to native arithmetic itself.
 
-Some small dense Raw configurations remain unaccepted: the latest Linux
-diagnostic has median regressions of approximately 0.58% to 2.39%; one Darwin
-G32 case has approximately 0.91%. Confidence intervals crossing 0.5% also
-remain unresolved. Retain direct native execution for configurations without
-validated acceptance; Raw is not automatically enabled by this patch. Whole
-model PP512/TG128 and model routing have not been revalidated against these
-candidate libraries. The optional APIs are suitable for review and further
-measurement, not a claim that all upstream acceptance work is complete.
+Cached C++ dispatcher measurements on Darwin, calling the same production
+library, cover G32 rows 1/16 at N x K = 1024 x 2048 and 2048 x 512. With 8
+threads, the four paired Raw median changes are -0.11%, -0.01%, +0.11% and
++0.16%; all bootstrap 95% upper bounds are below +0.30%. These measurements
+exclude Python dispatch and do not establish an improvement to the arithmetic
+from Raw itself. Generated Raw code tail-branches to the same C computation
+used by native calls.
+
+A separate 72-case public Torch-entry matrix covers rows 1/16/512, G32/W8
+Neon, and G32 mixed/all-SME2 with ordinary/shared/canonical activation packing.
+All 36 eight-thread median changes are below +0.5%, with 30 confidence bounds
+also passing. At 18 threads only 9 of 36 confidence bounds pass and 9 median
+changes exceed the threshold. The other cases remain unresolved or failed;
+this matrix does not establish blanket acceptance for either thread count.
+
+The corresponding focused 18-thread checks remain unaccepted: one median is
++1.23% and every confidence interval crosses +0.5%. An 18-thread A/A control,
+where both labels call exactly the same native operation, also has confidence
+upper bounds above +0.5% in 7 of 8 cases. This demonstrates insufficient
+measurement precision in those runs; it does not prove that Raw has no overhead
+or waive the acceptance gate. The last Linux diagnostic, from before this
+dense refactor, had median regressions of approximately 0.58% to
+2.39%; it cannot validate the new source. Larger-shape and mixed-ISA results
+must be retained with their specific call boundary and thread count.
+
+Retain direct native execution for configurations without validated acceptance;
+Raw is not automatically enabled by this patch. Whole-model PP512/TG128 and
+model routing have not been revalidated against these candidate libraries.
+The optional APIs are suitable for review and further measurement, not a claim
+that all upstream acceptance work is complete.

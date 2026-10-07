@@ -53,7 +53,7 @@ def initialize_native_raw(library_path):
         register_dense.restype = None
         dense_owners = []
         for index, symbol in enumerate(
-            ("flag_gems_arm_g32_linear", "flag_gems_arm_w8_linear")
+            ("flag_gems_arm_g32_compute", "flag_gems_arm_w8_compute")
         ):
             entry = _arm_native_raw_kernel.warmup(dummy, SYMBOL=symbol, grid=(1,))
             dso = ctypes.CDLL(entry.metadata_group[entry.name + ".so"])

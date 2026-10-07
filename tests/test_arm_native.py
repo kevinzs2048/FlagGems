@@ -54,12 +54,12 @@ def _a8(x):
     return code - zp[:, None], 1.0 / multiplier
 
 
-@pytest.mark.parametrize("rows", [1, 3, 16])
-@pytest.mark.parametrize("split", [0, 64, 128])
-def test_arm_g32_shared_and_raw(native, raw, rows, split):
+@pytest.mark.parametrize("rows", [1, 3, 16, 127, 512])
+@pytest.mark.parametrize("n,split", [(128, 0), (128, 64), (128, 128), (640, 0)])
+def test_arm_g32_shared_and_raw(native, raw, rows, n, split):
     torch.manual_seed(276 + rows)
     ops = native("w4a8_g32")
-    n, k = 128, 96
+    k = 96
     x = torch.randn(rows, k)
     w = torch.randint(-8, 8, (n, k), dtype=torch.int8)
     scale = (0.01 + torch.rand(n, k // 32) * 0.02).bfloat16()

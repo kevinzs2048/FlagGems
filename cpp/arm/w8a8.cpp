@@ -84,12 +84,66 @@ at::Tensor canonical(const at::Tensor& input) {
   });
   return out;
 }
+struct DenseW8Plan {
+  const float* input;
+  const uint8_t* rhs;
+  uint8_t* lhs;
+  float* output;
+  int64_t m, n, k, rows, cols;
+  Kernel kernel;
+  std::exception_ptr error;
+};
+
+}  // namespace
+extern "C" void flag_gems_arm_w8_compute(uint64_t descriptor) noexcept {
+  auto& plan = *reinterpret_cast<DenseW8Plan*>(descriptor);
+  try {
+    const auto& u = plan.kernel;
+    const auto m = plan.m, n = plan.n, k = plan.k, rows = plan.rows, cols = plan.cols;
+    at::parallel_for(0, (m + rows - 1) / rows, 1, [&](int64_t a, int64_t b) {
+      for (auto j = a; j < b; ++j) {
+        auto row = j * rows;
+        kai_run_lhs_quant_pack_qai8dxp_f32(std::min(rows, m - row),
+                                           k,
+                                           u.mr,
+                                           u.kr,
+                                           u.sr,
+                                           0,
+                                           plan.input + row * k,
+                                           k * 4,
+                                           plan.lhs + u.lhs_offset(row, k));
+      }
+    });
+    auto nc = (n + cols - 1) / cols;
+    float inf = std::numeric_limits<float>::infinity();
+    at::parallel_for(0, ((m + rows - 1) / rows) * nc, 1, [&](int64_t a, int64_t b) {
+      for (auto j = a; j < b; ++j) {
+        auto row = (j / nc) * rows, col = (j % nc) * cols;
+        u.run(std::min(rows, m - row),
+              std::min(cols, n - col),
+              k,
+              plan.lhs + u.lhs_offset(row, k),
+              plan.rhs + u.rhs_offset(col, k),
+              plan.output + row * n + col,
+              n * 4,
+              4,
+              -inf,
+              inf);
+      }
+    });
+  } catch (...) {
+    plan.error = std::current_exception();
+  }
+}
+namespace {
+
 __attribute__((noinline)) at::Tensor linear_impl(const at::Tensor& input,
                                                  const at::Tensor& packed,
                                                  int64_t n,
                                                  bool sme,
                                                  int64_t tile_rows,
-                                                 int64_t tile_cols) {
+                                                 int64_t tile_cols,
+                                                 bool raw = false) {
   TORCH_CHECK(input.device().is_cpu() && input.dim() == 2 && input.scalar_type() == at::kFloat &&
                   input.is_contiguous(),
               "Expected contiguous FP32 [M,K]");
@@ -105,38 +159,23 @@ __attribute__((noinline)) at::Tensor linear_impl(const at::Tensor& input,
   auto cols = int64_t(kai_roundup(tile_cols, u.ns));
   auto lhs = at::empty({int64_t(kai_get_lhs_packed_size_lhs_quant_pack_qai8dxp_f32(m, k, u.mr, u.kr, u.sr))},
                        packed.options());
-  at::parallel_for(0, (m + rows - 1) / rows, 1, [&](int64_t a, int64_t b) {
-    for (auto j = a; j < b; ++j) {
-      auto row = j * rows;
-      kai_run_lhs_quant_pack_qai8dxp_f32(std::min(rows, m - row),
-                                         k,
-                                         u.mr,
-                                         u.kr,
-                                         u.sr,
-                                         0,
-                                         input.const_data_ptr<float>() + row * k,
-                                         k * 4,
-                                         lhs.data_ptr<uint8_t>() + u.lhs_offset(row, k));
-    }
-  });
   auto out = at::empty({m, n}, input.options());
-  auto nc = (n + cols - 1) / cols;
-  float inf = std::numeric_limits<float>::infinity();
-  at::parallel_for(0, ((m + rows - 1) / rows) * nc, 1, [&](int64_t a, int64_t b) {
-    for (auto j = a; j < b; ++j) {
-      auto row = (j / nc) * rows, col = (j % nc) * cols;
-      u.run(std::min(rows, m - row),
-            std::min(cols, n - col),
-            k,
-            lhs.const_data_ptr<uint8_t>() + u.lhs_offset(row, k),
-            packed.const_data_ptr<uint8_t>() + u.rhs_offset(col, k),
-            out.data_ptr<float>() + row * n + col,
-            n * 4,
-            4,
-            -inf,
-            inf);
-    }
-  });
+  DenseW8Plan plan {input.const_data_ptr<float>(),
+                    packed.const_data_ptr<uint8_t>(),
+                    lhs.data_ptr<uint8_t>(),
+                    out.data_ptr<float>(),
+                    m,
+                    n,
+                    k,
+                    rows,
+                    cols,
+                    u,
+                    {}};
+  if (raw)
+    flag_gems::arm::invoke_dense_compute(plan, 1);
+  else
+    flag_gems_arm_w8_compute(reinterpret_cast<uint64_t>(&plan));
+  if (plan.error) std::rethrow_exception(plan.error);
   return out;
 }
 at::Tensor linear(const at::Tensor& input,
@@ -150,35 +189,16 @@ at::Tensor linear(const at::Tensor& input,
 at::Tensor canonical_raw(const at::Tensor& input) {
   return flag_gems::arm::invoke_raw([&] { return canonical(input); });
 }
-struct DenseW8Context {
-  const at::Tensor* input;
-  const at::Tensor* rhs;
-  int64_t n, tile_rows, tile_cols;
-  bool sme;
-  flag_gems::arm::RawResult<at::Tensor> output;
-  std::exception_ptr error;
-};
 at::Tensor linear_raw(const at::Tensor& input,
                       const at::Tensor& packed,
                       int64_t n,
                       bool sme,
                       int64_t tile_rows,
                       int64_t tile_cols) {
-  DenseW8Context context {&input, &packed, n, tile_rows, tile_cols, sme, {}, {}};
-  return flag_gems::arm::invoke_dense_raw(context, 1);
+  return linear_impl(input, packed, n, sme, tile_rows, tile_cols, true);
 }
 
 }  // namespace
-extern "C" void flag_gems_arm_w8_linear(uint64_t descriptor) noexcept {
-  auto& args = *reinterpret_cast<DenseW8Context*>(descriptor);
-  try {
-    args.output.construct([&] {
-      return linear_impl(*args.input, *args.rhs, args.n, args.sme, args.tile_rows, args.tile_cols);
-    });
-  } catch (...) {
-    args.error = std::current_exception();
-  }
-}
 TORCH_LIBRARY(flag_gems_arm_w8a8, m) {
   m.def("pack(Tensor weight, Tensor scales, bool sme) -> Tensor");
   m.def("canonical(Tensor input) -> Tensor");

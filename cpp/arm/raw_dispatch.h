@@ -99,14 +99,12 @@ auto invoke_raw(F&& operation) -> decltype(operation()) {
   }
 }
 
-// Small GEMMs call a typed operation leaf directly, avoiding the additional
-// type-erased callback used for large composite operations.
-template <class Context>
-at::Tensor invoke_dense_raw(Context& context, unsigned index) {
+// Dense computation has no Tensor return value: preparation and ownership
+// stay in the common host wrapper, and one Raw call runs the parallel plan.
+template <class Plan>
+void invoke_dense_compute(Plan& plan, unsigned index) {
   auto kernel = dense_raw_kernels[index].load(std::memory_order_acquire);
   TORCH_CHECK(kernel, "Initialize the dense CPU TLE Raw entries first");
-  kernel(&context, 0, 0, 0, 1, 1, 1);
-  if (context.error) std::rethrow_exception(context.error);
-  return context.output.take();
+  kernel(&plan, 0, 0, 0, 1, 1, 1);
 }
 }  // namespace flag_gems::arm
