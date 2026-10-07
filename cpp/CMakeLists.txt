@@ -46,6 +46,11 @@ option(FLAGGEMS_USE_EXTERNAL_PYBIND11 "whether to use external pybind11 library"
 option(FLAGGEMS_BUILD_C_EXTENSIONS "whether to build c extension" OFF)
 option(FLAGGEMS_BUILD_CTESTS "Whether to build CPP unit tests" ${FLAGGEMS_BUILD_C_EXTENSIONS})
 option(FLAGGEMS_INSTALL "Whether to install the package" ${PROJECT_IS_TOP_LEVEL})
+option(FLAGGEMS_BUILD_ARM_NATIVE "Build optional Arm CPU fused activation packing" OFF)
+
+if(FLAGGEMS_BUILD_ARM_NATIVE)
+  add_subdirectory(arm)
+endif()
 
 if(NOT FLAGGEMS_BUILD_C_EXTENSIONS)
   return()
