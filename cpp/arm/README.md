@@ -83,6 +83,11 @@ Explicit SME/Neon partitioning uses the actual OpenMP team size. If the
 runtime grants one worker, that worker computes both output partitions;
 otherwise at least one worker remains assigned to each partition.
 
+GDN recurrence preserves the historical compiler contraction policy (GCC
+`fast`, Clang/AppleClang `on`) for its multiply/add expressions. Native and
+TLE Raw share the same recurrence body and FP32 state updates. SiLU packing
+and the other sources keep `-ffp-contract=off`; applying that setting to GDN
+would remove its native FMA instructions and change state rounding.
 The ordinary Triton width-four convolution retains the historical
 `enable_fp_fusion=True` compilation policy. This is independent of the native
 SiLU packing policy.

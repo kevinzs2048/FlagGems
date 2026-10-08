@@ -87,6 +87,13 @@ if(FLAGGEMS_BUILD_ARM_KAI)
     Torch::Torch "${_torch_omp}" "${KLEIDIAI_LIBRARY}" ${CMAKE_DL_LIBS})
   target_compile_options(flag_gems_arm_native PRIVATE ${_omp_compile_flags})
   target_compile_options(flag_gems_arm_native PRIVATE -O3 -ffp-contract=off)
+  # GDN's historical recurrence uses compiler-contractible multiply/add
+  # expressions, including ATen vector operators. Preserve the original
+  # compiler defaults for this source: disabling contraction changes its
+  # FP32 state schedule and removes the native FMA instructions. The SiLU
+  # packing source and other operators retain their explicit off setting.
+  set_source_files_properties(gdn.cpp PROPERTIES COMPILE_OPTIONS
+    "$<$<CXX_COMPILER_ID:GNU>:-ffp-contract=fast>;$<$<CXX_COMPILER_ID:Clang,AppleClang>:-ffp-contract=on>")
   target_compile_features(flag_gems_arm_native PRIVATE cxx_std_17)
   # Bind the dense KAI implementation locally. Routed expert operations
   # explicitly resolve Torch's packed-weight ABI in runtime_kai.h.
