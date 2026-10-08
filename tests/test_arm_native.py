@@ -5,6 +5,8 @@
 import inspect
 import os
 import platform
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -85,6 +87,35 @@ def test_arm_g32_shared_and_raw(native, raw, rows, n, split):
     assert torch.equal(
         out, native("w4a8_g32", raw=True).linear_a8(canonical, *args[1:])
     )
+
+
+@pytest.mark.parametrize("actual_limit", [1, 2])
+def test_arm_g32_reduced_team_subprocess(native, raw, actual_limit):
+    # OpenMP reads this limit when its runtime initializes. Run the existing
+    # independent numerical tests in a fresh process, including all three
+    # input layouts and explicit SME/Neon partitioning where available.
+    environment = dict(os.environ)
+    environment["OMP_THREAD_LIMIT"] = str(actual_limit)
+    environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    environment["PYTHONPATH"] = os.pathsep.join(map(str, sys.path))
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "--tb=short",
+            str(Path(__file__).resolve()),
+            "-k",
+            "g32_shared_and_raw",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=90,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("rows,n,k", [(1, 17, 96), (3, 17, 96), (16, 64, 128)])

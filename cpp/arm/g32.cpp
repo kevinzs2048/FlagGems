@@ -342,10 +342,25 @@ extern "C" void flag_gems_arm_g32_compute(uint64_t descriptor) noexcept {
         const size_t end = begin + chunk + (tid < extra);
         for (size_t i = begin; i < end; ++i) run(false, i);
       } else {
-        bool sme = split == n || (split > 0 && omp_get_thread_num() < sme_workers);
-        auto& queue = sme ? si : ni;
-        auto& work = sme ? st : nt;
-        for (size_t i = queue.fetch_add(1); i < work.size(); i = queue.fetch_add(1)) run(sme, i);
+        auto drain = [&](bool sme) {
+          auto& queue = sme ? si : ni;
+          auto& work = sme ? st : nt;
+          for (size_t i = queue.fetch_add(1); i < work.size(); i = queue.fetch_add(1)) run(sme, i);
+        };
+        if (split > 0 && split < n) {
+          // OpenMP can grant fewer workers (thread limit or a nested region).
+          // Keep both output partitions owned, including a serialized team.
+          const int64_t actual_team = omp_get_num_threads();
+          if (actual_team == 1) {
+            drain(true);
+            drain(false);
+          } else {
+            const auto active_sme_workers = std::min(sme_workers, actual_team - 1);
+            drain(omp_get_thread_num() < active_sme_workers);
+          }
+        } else {
+          drain(split == n);
+        }
       }
     }
   } catch (...) {
