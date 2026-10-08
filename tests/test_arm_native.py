@@ -122,9 +122,9 @@ def test_arm_conv_prefill_state_and_empty_ranges(native, rows, silu):
     state = initial.clone()
     weight = torch.randn(dim, 4, dtype=torch.bfloat16)
     bias = torch.randn(dim, dtype=torch.bfloat16)
-    starts = torch.tensor([0, 0, rows], dtype=torch.int32)
-    slots = torch.tensor([2, 0], dtype=torch.int32)
-    flags = torch.tensor([False, True])
+    starts = torch.tensor([99, 0, 0, rows], dtype=torch.int32)[1:]
+    slots = torch.tensor([99, 2, 0], dtype=torch.int32)[1:]
+    flags = torch.tensor([False, False, True])[1:]
     expected_state = initial.clone()
     expected_state[2, :, :3].zero_()
     history = initial[0, :, :3].float()
@@ -154,14 +154,14 @@ def test_arm_conv_update_triton_state_and_tail(native, rows, silu, has_bias):
 
     torch.manual_seed(721 + rows)
     dim = 127
-    # Exercise positive noncontiguous input/history/weight strides and tails.
-    x = torch.randn(rows, dim * 2, dtype=torch.bfloat16)[:, ::2]
+    # Offset views exercise unaligned pointers as well as positive strides.
+    x = torch.randn(rows, dim * 2 + 1, dtype=torch.bfloat16)[:, 1::2]
     original = torch.randn(rows + 2, dim, 6, dtype=torch.bfloat16)
-    state = original.clone()[:, :, ::2]
-    weight = torch.randn(dim, 8, dtype=torch.bfloat16)[:, ::2]
-    bias = torch.randn(dim, dtype=torch.bfloat16) if has_bias else None
-    slots = torch.arange(rows, 0, -1, dtype=torch.int32)
-    expected_state = original[:, :, ::2].clone()
+    state = original.clone()[:, :, 1::2]
+    weight = torch.randn(dim, 8, dtype=torch.bfloat16)[:, 1::2]
+    bias = torch.randn(dim + 1, dtype=torch.bfloat16)[1:] if has_bias else None
+    slots = torch.arange(rows + 1, 0, -1, dtype=torch.int32)[1:]
+    expected_state = original[:, :, 1::2].clone()
     expected = torch.empty_like(x)
     for token, slot in enumerate(slots):
         history = expected_state[slot].float()
@@ -179,8 +179,8 @@ def test_arm_conv_update_triton_state_and_tail(native, rows, silu, has_bias):
     torch.testing.assert_close(out, expected, rtol=0.01, atol=0.016)
     assert torch.equal(state, expected_state)
     assert torch.equal(x, untouched)
-    assert torch.equal(state[0], original[0, :, ::2])
-    assert torch.equal(state[-1], original[-1, :, ::2])
+    assert torch.equal(state[0], original[0, :, 1::2])
+    assert torch.equal(state[-1], original[-1, :, 1::2])
 
 
 @pytest.mark.parametrize("rows", [1, 7, 32])

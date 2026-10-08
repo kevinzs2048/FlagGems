@@ -54,7 +54,17 @@ def _sleef_expf_u10_inline(value):
         "weight_stride1",
         "output_stride0",
         "output_stride1",
-    ]
+    ],
+    do_not_specialize_on_alignment=[
+        "input_ptr",
+        "state_ptr",
+        "weight_ptr",
+        "bias_ptr",
+        "output_ptr",
+        "starts_ptr",
+        "slots_ptr",
+        "initial_ptr",
+    ],
 )
 def _gdn_conv1d_prefill_width4_bf16_kernel(
     input_ptr,
