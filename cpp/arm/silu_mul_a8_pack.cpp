@@ -85,8 +85,8 @@ static __attribute__((always_inline)) inline int32_t silu_pack_impl(
         vst1q_s8(ptr + 16, vdupq_n_s8(127));
       } else
 #endif
-      vst1_s8(reinterpret_cast<int8_t*>(base + c * mr + lane * 8),
-              vqmovn_s16(vcombine_s16(vqmovn_s32(q0), vqmovn_s32(q1))));
+        vst1_s8(reinterpret_cast<int8_t*>(base + c * mr + lane * 8),
+                vqmovn_s16(vcombine_s16(vqmovn_s32(q0), vqmovn_s32(q1))));
     }
     const int32_t offset = -izp;
     std::memcpy(base + mr * k + lane * 4, &offset, 4);
@@ -108,8 +108,7 @@ static __attribute__((always_inline)) inline int32_t silu_pack_impl(
       }
 #endif
     } else if (first == 2) {
-      for (int32_t c = 0; c < k; c += 8)
-        vst1q_s8(reinterpret_cast<int8_t*>(base + c * 4 + 16), fill);
+      for (int32_t c = 0; c < k; c += 8) vst1q_s8(reinterpret_cast<int8_t*>(base + c * 4 + 16), fill);
     } else {
       for (int32_t c = 0; c < k; c += 8)
         vst1_s8(reinterpret_cast<int8_t*>(base + c * 4 + 24), vget_low_s8(fill));
@@ -134,14 +133,15 @@ extern "C" int32_t flag_gems_arm_silu_mul_a8_pack(
 #if defined(FLAGGEMS_ARM_SILU_OPERATOR_LIBRARY)
 // Only the standalone SiLU library exports this entry. This avoids a Raw
 // symbol resolving to a second copy in the composite Arm operator library.
-extern "C" int32_t flag_gems_arm_silu_mul_a8_pack_safe(uint64_t x,
-                                                       uint64_t out,
-                                                       int32_t m,
-                                                       int32_t stride,
-                                                       int32_t k,
-                                                       int32_t mr) noexcept {
+extern "C" int32_t flag_gems_arm_silu_mul_a8_pack_safe(
+    uint64_t x, uint64_t out, int32_t m, int32_t stride, int32_t k, int32_t mr) noexcept {
   try {
-    return silu_pack_impl(reinterpret_cast<const float*>(x), reinterpret_cast<uint8_t*>(out), m, stride, k, mr);
+    return silu_pack_impl(reinterpret_cast<const float*>(x),
+                          reinterpret_cast<uint8_t*>(out),
+                          m,
+                          stride,
+                          k,
+                          mr);
   } catch (...) {
     // Never unwind an allocation failure through the compiled CPU entry.
     return -2;
@@ -158,8 +158,7 @@ extern "C" int32_t flag_gems_arm_silu_standalone_leaf(
     __attribute__((alias("flag_gems_arm_silu_mul_a8_pack")));
 #else
 extern "C" int32_t flag_gems_arm_silu_standalone_leaf(
-    const float* input, uint8_t* output, int32_t m, int32_t stride,
-    int32_t k, int32_t mr) {
+    const float* input, uint8_t* output, int32_t m, int32_t stride, int32_t k, int32_t mr) {
   return flag_gems_arm_silu_mul_a8_pack(input, output, m, stride, k, mr);
 }
 #endif

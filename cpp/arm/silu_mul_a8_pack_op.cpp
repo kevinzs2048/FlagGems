@@ -33,8 +33,7 @@ at::Tensor silu_a8_impl(const at::Tensor& gu, int64_t mr, bool raw) {
     auto* output = out.data_ptr<uint8_t>();
     const int32_t stride = gu.stride(0);
     auto kernel = raw_silu[m == 1 ? (mr == 4) : 2].load(std::memory_order_acquire);
-    const int32_t status =
-        kernel(input, output, m, stride, k, mr);
+    const int32_t status = kernel(input, output, m, stride, k, mr);
     TORCH_CHECK(status == 0, "CPU Raw SiLU packing failed (status ", status, ")");
   } else if (m)
     TORCH_CHECK(flag_gems_arm_silu_mul_a8_pack(gu.const_data_ptr<float>(),
@@ -54,7 +53,9 @@ at::Tensor silu_a8_raw(const at::Tensor& gu, int64_t mr) {
 }
 }  // namespace
 // Covers the scalar-return prototype and single-row/general registration slots.
-extern "C" uint32_t flag_gems_arm_silu_raw_abi_version() noexcept { return 1; }
+extern "C" uint32_t flag_gems_arm_silu_raw_abi_version() noexcept {
+  return 1;
+}
 extern "C" void flag_gems_arm_register_silu_raw_kernel(uint64_t address) noexcept {
   for (auto& slot : raw_silu)
     slot.store(address ? reinterpret_cast<SiluRawKernel>(address) : uninitialized_silu_raw,

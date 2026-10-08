@@ -268,13 +268,13 @@ at::Tensor linear_raw(const at::Tensor& input, const at::Tensor& weight, int64_t
   return flag_gems::arm::invoke_raw([&] { return linear(input, weight, n); });
 }
 __attribute__((noinline)) at::Tensor moe_fused(const at::Tensor& x,
-                     const at::Tensor& r,
-                     const at::Tensor& w1,
-                     const at::Tensor& w2,
-                     int64_t h,
-                     int64_t i,
-                     int64_t top,
-                     bool norm) {
+                                               const at::Tensor& r,
+                                               const at::Tensor& w1,
+                                               const at::Tensor& w2,
+                                               int64_t h,
+                                               int64_t i,
+                                               int64_t top,
+                                               bool norm) {
   return moe_impl(x, r, w1, w2, h, i, top, norm, false, true);
 }
 at::Tensor moe_fused_raw(const at::Tensor& x,
