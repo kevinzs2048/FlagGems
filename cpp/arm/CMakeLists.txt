@@ -8,8 +8,54 @@ find_package(Torch REQUIRED)
 add_library(flag_gems_arm_silu_native SHARED
   silu_mul_a8_pack.cpp silu_mul_a8_pack_op.cpp)
 target_link_libraries(flag_gems_arm_silu_native PRIVATE Torch::Torch)
+target_compile_definitions(flag_gems_arm_silu_native PRIVATE FLAGGEMS_ARM_SILU_OPERATOR_LIBRARY=1)
+if(UNIX AND NOT APPLE)
+  # Keep native and Raw arithmetic in this DSO when both Arm libraries load.
+  target_link_options(flag_gems_arm_silu_native PRIVATE "LINKER:-Bsymbolic-functions")
+endif()
 # Preserve the reference FP32 schedule; required FMA sites use explicit NEON.
 target_compile_options(flag_gems_arm_silu_native PRIVATE -O3 -ffp-contract=off)
+
+# Use the LLVM toolchain matching FlagTree CPU, not necessarily Torch's C++
+# compiler. Native-only builds do not require a bitcode compiler.
+set(FLAGGEMS_ARM_BITCODE_COMPILER "" CACHE FILEPATH
+  "clang++ from the LLVM toolchain used to build FlagTree CPU")
+set(FLAGGEMS_ARM_BITCODE_CPU "generic" CACHE STRING
+  "LLVM CPU target for SiLU bitcode (native restricts portability)")
+set(FLAGGEMS_ARM_SILU_BITCODE_MODE "kernel" CACHE STRING
+  "SiLU bitcode contents: kernel (inline arithmetic) or boundary (native leaf)")
+set_property(CACHE FLAGGEMS_ARM_SILU_BITCODE_MODE PROPERTY STRINGS kernel boundary)
+if(FLAGGEMS_ARM_BITCODE_COMPILER)
+  if(FLAGGEMS_ARM_SILU_BITCODE_MODE STREQUAL "kernel")
+    set(_silu_bitcode_source silu_mul_a8_pack.cpp)
+  elseif(FLAGGEMS_ARM_SILU_BITCODE_MODE STREQUAL "boundary")
+    set(_silu_bitcode_source silu_mul_a8_pack_boundary.cpp)
+  else()
+    message(FATAL_ERROR "FLAGGEMS_ARM_SILU_BITCODE_MODE must be kernel or boundary")
+  endif()
+  set(_silu_bitcode "${CMAKE_CURRENT_BINARY_DIR}/flag_gems_arm_silu.bc")
+  set(_silu_sysroot_flags)
+  if(APPLE AND CMAKE_OSX_SYSROOT)
+    list(APPEND _silu_sysroot_flags -isysroot "${CMAKE_OSX_SYSROOT}")
+  endif()
+  if(APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET)
+    list(APPEND _silu_sysroot_flags
+      "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+  endif()
+  add_custom_command(OUTPUT "${_silu_bitcode}"
+    COMMAND "${FLAGGEMS_ARM_BITCODE_COMPILER}" -O3 -std=c++17 -fPIC
+      -ffp-contract=off -DFLAGGEMS_ARM_SILU_OPERATOR_LIBRARY=1
+      -DFLAGGEMS_ARM_SILU_FUSE_PADDING=1
+      "-mcpu=${FLAGGEMS_ARM_BITCODE_CPU}" ${_silu_sysroot_flags}
+      -emit-llvm -c "${CMAKE_CURRENT_SOURCE_DIR}/${_silu_bitcode_source}"
+      -o "${_silu_bitcode}"
+    DEPENDS ${_silu_bitcode_source} silu_mul_a8_pack.h VERBATIM)
+  add_custom_target(flag_gems_arm_silu_bitcode ALL DEPENDS "${_silu_bitcode}")
+  if(FLAGGEMS_INSTALL)
+    install(FILES "${_silu_bitcode}"
+      DESTINATION flag_gems/runtime/backend/_arm/lib)
+  endif()
+endif()
 
 option(FLAGGEMS_BUILD_ARM_KAI "Build Arm quantized GEMM and routed MoE" OFF)
 if(FLAGGEMS_BUILD_ARM_KAI)

@@ -8,7 +8,9 @@ does not change the default dispatcher or existing GPU builds.
 
 ## Build
 
-Use the same Python and Torch environment as inference. The dense kernels
+Use the same Python and Torch environment as inference. Set
+`FLAGGEMS_VENDOR=arm` to select the CPU backend, including on Linux systems
+without an accelerator device. The dense kernels
 require KleidiAI 1.29 headers and its AArch64 static library; routed experts use
 the packed-weight ABI and the exact KAI functions exported by that Torch build.
 Missing required ISA features or exported symbols cause a Python error rather
@@ -51,7 +53,8 @@ linear = raw.linear  # initialize once and retain the callable
 Groups are `w4a8_g32`, `w8a8`, `moe` and `gdn`. Preparation and thread-policy
 helpers retain their native entry. Inference methods expose native and `.raw`
 Torch overloads. CPU Raw requires FlagTree CPU's scalar `raw_call` support with
-void returns (the `triton_v3.7.x` / 3.7.2 native-call port). A CPU build lacking
+void returns (the `triton_v3.7.x` / 3.7.2 native-call port). SiLU also requires
+the optional single-program scalar-return C entry described below. A CPU build lacking
 that optional capability can still import FlagGems and use native operators.
 
 The chain is a compiled `@triton.jit` entry, CPU `raw_call`, then C++/Neon/KAI.
@@ -66,7 +69,7 @@ all GEMM tiles. Composite MoE/GDN operations cross the boundary once per
 complete operation.
 The C ABI catches C++ exceptions and the Torch caller rethrows them after the
 compiled entry returns. Tensor references and descriptors stay alive until
-all parallel work completes. The compiled dense entry symbols and native
+all parallel work completes. The compiled Raw entry symbols and native
 library are an internal matched ABI: rebuild the library and restart the
 process when updating this implementation.
 
@@ -76,6 +79,9 @@ packing worksharing loop and barrier with only one useful iteration. Equal
 based on the actual OpenMP team size. Mixed SME2/Neon and partial-tile work
 retain dynamic scheduling. Other noncanonical G32 packing paths synchronize
 once after writing their disjoint LHS regions.
+Explicit SME/Neon partitioning uses the actual OpenMP team size. If the
+runtime grants one worker, that worker computes both output partitions;
+otherwise at least one worker remains assigned to each partition.
 
 Linear inputs are contiguous FP32 `[M,K]`; W4 G32 scales are BF16, W8 scales
 are FP32. `linear_a8` consumes canonical rows rather than requantizing them.
@@ -121,6 +127,8 @@ using `prepare_conv_prefill`, then retain the `.triton` Torch overload.
 The decode wrapper treats each token as a one-token sequence with existing
 history and caches its read-only sequence metadata. It supports positive
 noncontiguous strides, partial channel blocks and empty batches.
+Cached convolution entries do not specialize on the alignment of their dummy
+warmup tensors. Offset data and metadata views retain their documented support.
 
 The SiLU exponential uses the SLEEF-u10 polynomial with its accompanying Boost
 license. BF16 convolution outputs can differ from scalar `expf` by one BF16
@@ -164,59 +172,83 @@ more. A noisy confidence interval crossing that threshold requires further
 measurement. Microbenchmarks do not establish whole-model PP512/TG128 speed;
 model integration must also verify its complete prefill/decode path.
 
-### Candidate acceptance status (2026-10-08)
+### SiLU Raw call boundary
 
-These are opt-in candidate APIs. Functional coverage does not imply that every
-shape or platform meets the performance gate. The latest Darwin test run has
-72 passing cases, including an unequal number of Neon tiles per worker and
-127/512-row packing coverage. The last Linux AArch64 run before adding the
-decode wrapper has 36 passing cases and 9 SME2 cases skipped on unsupported
-hardware. The decode wrapper, dense computation-plan refactor and expanded
-tests still require Linux revalidation.
+The SiLU warmup requests `enable_single_program_entry=True` and registers
+`compiled.metadata.single_program_name`. This additional compiler-generated
+C entry fixes program IDs to zero and the grid to `(1,1,1)`. Its ABI contains
+the six input arguments. With `single_program_return_type="i32"`, the final
+status output pointer becomes a C return value, also avoiding six unused grid
+arguments on every cached C++ call. The normal Triton kernel still writes
+its output status tensor; LLVM promotes the additional entry's local scalar
+to a register return after inlining. The regular compiled entry and normal Triton launcher retain
+their full grid behavior. Without linked bitcode, the additional entry tail-branches to a non-throwing C ABI
+leaf that returns its status result. The direct native and external Raw entries inline the same arithmetic
+and share one scratch row per thread within their native library. Linked
+arithmetic variants own separate per-thread scratch storage, retained by their
+compiled shared libraries. Boundary-only variants call the native scratch owner. Allocation failures are caught before
+returning through the generated entry. The external SLEEF C math function is
+declared non-throwing, so an enclosing exception handler does not force the
+compiler to spill live vector values on every loop iteration. Error recovery,
+strided rows, rounding and the large-input SLEEF fallback are tested.
 
-Paired Darwin public-entry measurements of width-four BF16 decode convolution
-at batch 1 (including cached metadata and Python transposes) give:
+For small single-row calls, an optional LLVM bitcode build lets the CPU JIT
+inline the same native arithmetic into the Triton entry. The default
+`-DFLAGGEMS_ARM_SILU_BITCODE_MODE=kernel` selects this mode. Alternatively,
+`-DFLAGGEMS_ARM_SILU_BITCODE_MODE=boundary` links only the C++ exception
+boundary into the Triton entry, retaining the arithmetic compiled in the
+standalone native library. This avoids an extra call to an external exception
+wrapper without recompiling the arithmetic with a different LLVM toolchain.
+The boundary calls the uniquely named `flag_gems_arm_silu_standalone_leaf`;
+it cannot resolve the composite Arm library's copy. ELF builds export an alias
+at the native function's address; other object formats use a forwarding entry.
+Choose a mode using measurements on the target platform, shape and compiler.
+Neither mode silently replaces a failed compilation with native execution.
 
-| Channels | Threads | Native (us) | Triton (us) | Paired latency change |
-| --- | --- | --- | --- | --- |
-| 6144 | 8 | 16.48 | 10.30 | -37.26% |
-| 8192 | 8 | 21.02 | 11.94 | -42.94% |
-| 6144 | 18 | 10.03 | 9.59 | -5.16% |
-| 8192 | 18 | 12.31 | 10.43 | -15.21% |
+Build with
+`-DFLAGGEMS_ARM_BITCODE_COMPILER=/path/to/matching/llvm/bin/clang++` and an
+explicit `-DCMAKE_OSX_SYSROOT=/path/to/MacOSX.sdk` on Darwin. CMake uses `-fPIC`
+and installs `flag_gems_arm_silu.bc` alongside the operator library. The default
+bitcode CPU is `generic`; `-DFLAGGEMS_ARM_BITCODE_CPU=native` tunes to the build
+machine and limits portability to compatible CPUs. The LLVM version, OS, ABI
+and CPU features must match the FlagTree CPU inference environment.
 
-SiLU/A8's latest Darwin direct Torch-entry comparison covers rows 1, 4, 7,
-16, 32 and 512 at K=512 and MR=1/4: paired median Raw latency changes range
-from -0.04% to +0.33%. Other tested K values and empty rows have correctness
-coverage. Public Python-entry savings also include loader overhead differences
-and must not be described as improvements to native arithmetic itself.
+Set `FLAGGEMS_ARM_SILU_BITCODE=/path/to/flag_gems_arm_silu.bc` before Raw
+initialization to opt in. Warmup prepares single-row MR1 and MR4 entries with
+the selected bitcode, plus a general entry using the C ABI leaf for multiple
+rows. Kernel-mode entries own their arithmetic and per-thread scratch storage;
+boundary-mode entries use the standalone native function's scratch storage.
+The C++ operator selects by row count and packing layout. All three entries
+preserve the same quantization and padded output bytes. For diagnostics,
+`FLAGGEMS_ARM_SILU_SPECIALIZE_MR=0` links a single general entry instead.
+Prepared entries do not specialize on dummy warmup pointer alignment; offset
+Tensor views and stack descriptors remain valid inputs. Native execution does
+not depend on bitcode. Without a bitcode path, Raw uses
+the general external C leaf; this is an explicit configuration, not a runtime
+fallback after a failed compilation. Registration checks native ABI version 1
+and the compiler's scalar-return metadata. Concurrent callers cannot observe
+partially registered entries. Updating a library or bitcode requires restarting
+the process; prepared kernels retain their loaded code for their lifetime.
 
-Cached C++ dispatcher measurements on Darwin, calling the same production
-library, cover G32 rows 1/16 at N x K = 1024 x 2048 and 2048 x 512. With 8
-threads, the four paired Raw median changes are -0.11%, -0.01%, +0.11% and
-+0.16%; all bootstrap 95% upper bounds are below +0.30%. These measurements
-exclude Python dispatch and do not establish an improvement to the arithmetic
-from Raw itself. Generated Raw code tail-branches to the same C computation
-used by native calls.
+Padded MR4 rows are written directly as canonical A8 zero panels (code 127,
+offset -127, scale 1), without evaluating SiLU or quantizing a scratch zero row.
+Both native and Raw use direct zero-panel writes. The optional bitcode build
+also coalesces single-row MR4 codes and padding into one output pass; the native
+reference retains its previously validated packing loop. Tests compare the
+complete bytes against independent padded-panel expectations.
 
-A separate 72-case public Torch-entry matrix covers rows 1/16/512, G32/W8
-Neon, and G32 mixed/all-SME2 with ordinary/shared/canonical activation packing.
-All 36 eight-thread median changes are below +0.5%, with 30 confidence bounds
-also passing. At 18 threads only 9 of 36 confidence bounds pass and 9 median
-changes exceed the threshold. The other cases remain unresolved or failed;
-this matrix does not establish blanket acceptance for either thread count.
+The Python SiLU helper selects the named `pack_raw` operator. Its default
+schema avoids the nonempty overload-name handling in Torch's Python binding;
+`pack.raw` remains a compatible alias to the same C++ implementation. Both
+use normal Torch operators, preserving Torch dispatch interception.
 
-The corresponding focused 18-thread checks remain unaccepted: one median is
-+1.23% and every confidence interval crosses +0.5%. An 18-thread A/A control,
-where both labels call exactly the same native operation, also has confidence
-upper bounds above +0.5% in 7 of 8 cases. This demonstrates insufficient
-measurement precision in those runs; it does not prove that Raw has no overhead
-or waive the acceptance gate. The last Linux diagnostic, from before this
-dense refactor, had median regressions of approximately 0.58% to
-2.39%; it cannot validate the new source. Larger-shape and mixed-ISA results
-must be retained with their specific call boundary and thread count.
+Only the standalone SiLU library exports this status entry. On Linux its
+function references bind locally, preventing a separately loaded composite
+Arm library from changing which implementation a call measures or executes.
 
-Retain direct native execution for configurations without validated acceptance;
-Raw is not automatically enabled by this patch. Whole-model PP512/TG128 and
-model routing have not been revalidated against these candidate libraries.
-The optional APIs are suitable for review and further measurement, not a claim
-that all upstream acceptance work is complete.
+Native execution remains the default. Select Raw only after validating the
+actual caller, shapes and thread policy on the target system. Cached C++
+measurements exclude Python overhead and cannot substitute for public-entry
+or whole-model measurements. Keep benchmark samples and source/build hashes
+with the review evidence rather than hard-coding a machine's performance or
+CPU placement into the operator implementation.

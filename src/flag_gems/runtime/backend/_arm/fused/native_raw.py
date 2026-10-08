@@ -19,7 +19,7 @@ _lock = threading.Lock()
 _owners = None
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["descriptor_ptr"])
 def _arm_native_raw_kernel(descriptor_ptr, SYMBOL: tl.constexpr):
     raw_call(
         SYMBOL,
