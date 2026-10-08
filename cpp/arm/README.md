@@ -83,6 +83,15 @@ Explicit SME/Neon partitioning uses the actual OpenMP team size. If the
 runtime grants one worker, that worker computes both output partitions;
 otherwise at least one worker remains assigned to each partition.
 
+The ordinary Triton width-four convolution retains the historical
+`enable_fp_fusion=True` compilation policy. This is independent of the native
+SiLU packing policy.
+Its prepared programs use the historical static OpenMP distribution, with
+the team bounded by the available programs and caller's thread setting.
+Nested parallel calls execute serially. This keeps all workers useful when
+the program count is not divisible by the thread count, including 128
+programs on an 18-thread CPU.
+
 Linear inputs are contiguous FP32 `[M,K]`; W4 G32 scales are BF16, W8 scales
 are FP32. `linear_a8` consumes canonical rows rather than requantizing them.
 Dense KAI activation packing uses its ties-away schedule. Torch-packed routed

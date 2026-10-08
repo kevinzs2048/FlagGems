@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
+#include <omp.h>
 #include <torch/library.h>
+#include <algorithm>
 #include <limits>
 #include <mutex>
 #include <unordered_map>
@@ -86,32 +88,42 @@ at::Tensor conv(const at::Tensor& input,
           ss1 = i32(state.stride(1)), ss2 = i32(state.stride(2));
   int32_t ws0 = i32(weight.stride(0)), ws1 = i32(weight.stride(1)), os0 = i32(output.stride(0)),
           os1 = i32(output.stride(1));
-  at::parallel_for(0, grid, 1, [&](int64_t a, int64_t b) {
-    for (auto pid = a; pid < b; ++pid)
-      fn(input.const_data_ptr(),
-         state.data_ptr(),
-         weight.const_data_ptr(),
-         bias ? bias->const_data_ptr() : weight.const_data_ptr(),
-         output.data_ptr(),
-         starts.const_data_ptr(),
-         slots.const_data_ptr(),
-         flags.const_data_ptr(),
-         is0,
-         is1,
-         ss0,
-         ss1,
-         ss2,
-         ws0,
-         ws1,
-         os0,
-         os1,
-         pid,
-         0,
-         0,
-         grid,
-         1,
-         1);
-  });
+  auto run = [&](int64_t pid) {
+    fn(input.const_data_ptr(),
+       state.data_ptr(),
+       weight.const_data_ptr(),
+       bias ? bias->const_data_ptr() : weight.const_data_ptr(),
+       output.data_ptr(),
+       starts.const_data_ptr(),
+       slots.const_data_ptr(),
+       flags.const_data_ptr(),
+       is0,
+       is1,
+       ss0,
+       ss1,
+       ss2,
+       ws0,
+       ws1,
+       os0,
+       os1,
+       pid,
+       0,
+       0,
+       grid,
+       1,
+       1);
+  };
+  // Match the historical CPU Triton launcher's balanced static distribution.
+  // ATen's ceil-sized ranges can leave workers idle (128 programs / 18
+  // threads becomes 16 active ranges), affecting heterogeneous Arm CPUs.
+  // The kernel only touches prepared pointers; no ATen TLS is needed inside.
+  const auto workers = std::min<int64_t>(grid, at::get_num_threads());
+  if (workers <= 1 || at::in_parallel_region() || omp_in_parallel()) {
+    for (int64_t pid = 0; pid < grid; ++pid) run(pid);
+  } else {
+#pragma omp parallel for num_threads(workers) schedule(static)
+    for (int64_t pid = 0; pid < grid; ++pid) run(pid);
+  }
   return output;
 }
 }  // namespace

@@ -91,10 +91,12 @@ def test_arm_g32_shared_and_raw(native, raw, rows, n, split):
 
 
 @pytest.mark.parametrize("actual_limit", [1, 2])
-def test_arm_g32_reduced_team_subprocess(native, raw, actual_limit):
+def test_arm_reduced_team_subprocess(native, raw, actual_limit):
     # OpenMP reads this limit when its runtime initializes. Run the existing
     # independent numerical tests in a fresh process, including all three
     # input layouts and explicit SME/Neon partitioning where available.
+    # Convolution also covers empty sequences, tails and cache updates when
+    # its static OpenMP loop receives fewer workers than requested.
     environment = dict(os.environ)
     environment["OMP_THREAD_LIMIT"] = str(actual_limit)
     environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
@@ -108,7 +110,10 @@ def test_arm_g32_reduced_team_subprocess(native, raw, actual_limit):
             "--tb=short",
             str(Path(__file__).resolve()),
             "-k",
-            "g32_shared_and_raw",
+            (
+                "g32_shared_and_raw or conv_prefill_state_and_empty_ranges "
+                "or conv_update_triton_state_and_tail"
+            ),
         ],
         env=environment,
         capture_output=True,

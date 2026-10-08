@@ -191,7 +191,9 @@ def prepare_conv_prefill(library_path, dim, has_bias=True, silu=True):
             HAS_BIAS=has_bias,
             SILU=silu,
             grid=(1,),
-            enable_fp_fusion=False,
+            # Preserve the historical CPU Triton convolution's contraction
+            # policy, independently of the native SiLU packing build flags.
+            enable_fp_fusion=True,
         )
         dso = ctypes.CDLL(compiled.metadata_group[compiled.name + ".so"])
         address = ctypes.cast(getattr(dso, compiled.name), ctypes.c_void_p).value
