@@ -74,7 +74,10 @@ library are an internal matched ABI: rebuild the library and restart the
 process when updating this implementation.
 
 Neon-only single-row G32 calls pack A8 before the OpenMP fork, avoiding a
-packing worksharing loop and barrier with only one useful iteration. Equal
+packing worksharing loop and barrier with only one useful iteration. For small
+Neon calls, the requested worker count is an upper bound: the team is limited
+to the larger of the useful packing tasks and GEMM tiles, avoiding idle workers
+that compete for CPUs and wait at barriers. Equal
 128-column tiles with at most 32 rows use contiguous per-worker ownership
 based on the actual OpenMP team size. Mixed SME2/Neon and partial-tile work
 retain dynamic scheduling. Other noncanonical G32 packing paths synchronize
@@ -82,6 +85,13 @@ once after writing their disjoint LHS regions.
 Explicit SME/Neon partitioning uses the actual OpenMP team size. If the
 runtime grants one worker, that worker computes both output partitions;
 otherwise at least one worker remains assigned to each partition.
+
+W8 calls with one row tile likewise cap the compute team at the number of
+column tiles when that is smaller than the caller's thread pool. A single
+column tile executes directly. Packing and multi-row-tile scheduling keep
+their existing Torch parallel policy; nested calls do not create another
+OpenMP team. This preserves the configured thread count and covers partial
+column tiles even when the runtime grants fewer workers than requested.
 
 GDN recurrence preserves the historical compiler contraction policy (GCC
 `fast`, Clang/AppleClang `on`) for its multiply/add expressions. Native and

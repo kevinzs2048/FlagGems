@@ -186,7 +186,9 @@ extern "C" void flag_gems_arm_g32_compute(uint64_t descriptor) noexcept {
     struct alignas(128) Claim {
       std::atomic<int> active {0};
     };
-    Claim claims[32];
+    // Three explicitly selected Apple clusters plus the unknown-CPU fallback.
+    // No path indexes beyond 3; avoid initializing 28 unused cache lines.
+    Claim claims[4];
     // A single Neon input row has no parallel packing work. Prepare it before
     // forking so workers do not enter a worksharing loop and packing barrier.
     const bool serial_neon_pack = m == 1 && split == 0 && !canonical_input;
@@ -200,9 +202,17 @@ extern "C" void flag_gems_arm_g32_compute(uint64_t descriptor) noexcept {
                                          static_cast<const float*>(input),
                                          k * 4,
                                          lhs);
+    // Small Neon calls have one M tile. Workers beyond both the packing
+    // tasks and output tiles can only spin at barriers and compete for CPUs.
+    // Preserve packing parallelism when it exceeds the number of GEMM tiles.
+    auto team_workers = workers;
+    if (split == 0 && m <= 32) {
+      const int64_t packing_tasks = serial_neon_pack ? 1 : (m + ne.mr - 1) / ne.mr;
+      team_workers = std::min(workers, std::max<int64_t>(nt.size(), packing_tasks));
+    }
 // Quantizers use identical per-row mathematics; layouts have separate packs.
 // Output regions are disjoint, so SME2 and Neon GEMMs can execute together.
-#pragma omp parallel num_threads(workers)
+#pragma omp parallel num_threads(team_workers)
     {
       if (serial_neon_pack) {
         // The fork publishes the prepared LHS to every worker.

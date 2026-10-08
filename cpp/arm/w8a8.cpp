@@ -12,6 +12,7 @@
 #include <kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi8cxp/kai_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm.h>
 #include <kai/ukernels/matmul/pack/kai_lhs_quant_pack_qai8dxp_f32.h>
 #include <kai/ukernels/matmul/pack/kai_rhs_pack_nxk_qsi8cxp_qsi8cx_neon.h>
+#include <omp.h>
 #include <torch/library.h>
 #include <algorithm>
 #include <limits>
@@ -116,7 +117,7 @@ extern "C" void flag_gems_arm_w8_compute(uint64_t descriptor) noexcept {
     });
     auto nc = (n + cols - 1) / cols;
     float inf = std::numeric_limits<float>::infinity();
-    at::parallel_for(0, ((m + rows - 1) / rows) * nc, 1, [&](int64_t a, int64_t b) {
+    auto run_tiles = [&](int64_t a, int64_t b) {
       for (auto j = a; j < b; ++j) {
         auto row = (j / nc) * rows, col = (j % nc) * cols;
         u.run(std::min(rows, m - row),
@@ -130,7 +131,20 @@ extern "C" void flag_gems_arm_w8_compute(uint64_t descriptor) noexcept {
               -inf,
               inf);
       }
-    });
+    };
+    // A single row tile may expose fewer column jobs than the global pool.
+    // The leaf touches only prepared buffers; use a bounded OpenMP team and
+    // preserve the caller's thread policy and nested-parallel guard.
+    if (m <= rows && nc < at::get_num_threads() && !at::in_parallel_region() && !omp_in_parallel()) {
+      if (nc == 1) {
+        run_tiles(0, 1);
+      } else {
+#pragma omp parallel for num_threads(nc) schedule(static)
+        for (int64_t j = 0; j < nc; ++j) run_tiles(j, j + 1);
+      }
+    } else {
+      at::parallel_for(0, ((m + rows - 1) / rows) * nc, 1, run_tiles);
+    }
   } catch (...) {
     plan.error = std::current_exception();
   }

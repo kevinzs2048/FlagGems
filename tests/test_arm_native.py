@@ -59,7 +59,7 @@ def _a8(x):
 
 @pytest.mark.parametrize("rows", [1, 3, 16, 127, 512])
 @pytest.mark.parametrize("n,split", [(128, 0), (128, 64), (128, 128), (640, 0)])
-def test_arm_g32_shared_and_raw(native, raw, rows, n, split):
+def test_arm_g32_shared_and_raw(native, raw, rows, n, split, monkeypatch):
     torch.manual_seed(276 + rows)
     ops = native("w4a8_g32")
     k = 96
@@ -77,7 +77,7 @@ def test_arm_g32_shared_and_raw(native, raw, rows, n, split):
         "mgk,ngk->mng", q.reshape(rows, -1, 32), w.float().reshape(n, -1, 32)
     )
     expected = (accum * scale.float()[None]).sum(-1) * sx[:, None]
-    args = [x, packed, n, split, 4, 2]
+    args = [x, packed, n, split, 8 if n == 640 else 4, 2]
     out = ops.linear(*args)
     torch.testing.assert_close(out, expected, rtol=2e-4, atol=2e-5)
     assert torch.equal(out, native("w4a8_g32", raw=True).linear(*args))
@@ -88,6 +88,12 @@ def test_arm_g32_shared_and_raw(native, raw, rows, n, split):
     assert torch.equal(
         out, native("w4a8_g32", raw=True).linear_a8(canonical, *args[1:])
     )
+
+    if 0 < split < n and platform.system() == "Darwin":
+        monkeypatch.setenv("FLAGGEMS_ARM_APPLE_18CPU_CLUSTER_POLICY", "1")
+        cluster_args = [*args[:-1], -1]
+        assert torch.equal(out, ops.linear(*cluster_args))
+        assert torch.equal(out, native("w4a8_g32", raw=True).linear(*cluster_args))
 
 
 @pytest.mark.parametrize("actual_limit", [1, 2])
@@ -145,6 +151,34 @@ def test_arm_w8_tail_and_quantization(native, raw, rows, n, k, sme):
     out = ops.linear(*args)
     torch.testing.assert_close(out, expected, rtol=2e-4, atol=2e-5)
     assert torch.equal(out, native("w8a8", raw=True).linear(*args))
+
+
+@pytest.mark.parametrize("sme", [False, True])
+def test_arm_w8_small_tile_team_and_partial_column(native, raw, sme):
+    torch.manual_seed(9714)
+    previous_threads = torch.get_num_threads()
+    try:
+        torch.set_num_threads(8)
+        rows, n, k = 7, 530, 96
+        x = torch.randn(rows, k)
+        w = torch.randint(-127, 128, (n, k), dtype=torch.int8)
+        scales = torch.rand(n) * 0.02 + 0.001
+        ops = native("w8a8")
+        try:
+            packed = ops.pack(w, scales, sme)
+        except RuntimeError as error:
+            if sme and "ISA is unavailable" in str(error):
+                pytest.skip("SME2 unavailable")
+            raise
+        q, sx = _a8(x)
+        expected = (q @ w.float().t()) * sx[:, None] * scales[None]
+        args = [x, packed, n, sme, 32, 128]
+        value = ops.linear(*args)
+        torch.testing.assert_close(value, expected, rtol=2e-4, atol=2e-5)
+        assert torch.equal(value, native("w8a8", raw=True).linear(*args))
+        assert torch.get_num_threads() == 8
+    finally:
+        torch.set_num_threads(previous_threads)
 
 
 @pytest.mark.parametrize("rows", [0, 1, 7, 16])
