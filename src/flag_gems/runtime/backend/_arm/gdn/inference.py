@@ -529,5 +529,3 @@ def torch_fused_sigmoid_gating_delta_rule_update(
             else:
                 final_state[token].copy_(state.to(final_state.dtype))
     return output, final_state
-
-

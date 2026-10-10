@@ -1260,6 +1260,74 @@ void gemma_fused_add_rmsnorm_raw(at::Tensor& input, at::Tensor& residual,
   gemma_fused_add_rmsnorm_impl(input, residual, weight, epsilon, true);
 }
 
+// Compiled ordinary CPU Triton entries are prepared once by FlagGems Python.
+// Their owners remain alive there; the host path never performs a JIT lookup.
+using GemmaTritonEntry = void (*)(
+    const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+std::atomic<GemmaTritonEntry> gemma_triton_entries[3][2] {};
+int gemma_triton_index(int64_t hidden) {
+  if (hidden == 128) return 0;
+  if (hidden == 1024) return 1;
+  if (hidden == 2048) return 2;
+  TORCH_CHECK(false, "Prepared Gemma Triton supports hidden sizes 128, 1024, 2048");
+}
+void register_gemma_triton_kernel(int64_t hidden, bool fused, int64_t address) {
+  TORCH_CHECK(address != 0, "Gemma Triton kernel address must be nonzero");
+  gemma_triton_entries[gemma_triton_index(hidden)][fused].store(reinterpret_cast<GemmaTritonEntry>(address),
+                                                                std::memory_order_release);
+}
+bool gemma_triton_fp_fusion() {
+  TORCH_CHECK(BFloatVec::size() == 8 && FloatVec::size() == 4,
+              "Prepared Gemma Triton requires the eight-lane BF16 NEON layout");
+#if defined(__GNUC__) && !defined(__clang__)
+  return true;
+#else
+  return false;
+#endif
+}
+void execute_gemma_triton(at::Tensor& output,
+                          const at::Tensor& input,
+                          const at::Tensor& weight,
+                          at::Tensor* residual,
+                          double epsilon) {
+  TORCH_CHECK(static_cast<float>(epsilon) == static_cast<float>(1e-6),
+              "Prepared Gemma Triton expects epsilon 1e-6");
+  const int64_t hidden = weight.numel();
+  const int64_t rows = input.numel() / hidden;
+  TORCH_CHECK(input.numel() <= INT32_MAX, "Gemma Triton supports at most INT32_MAX elements");
+  TORCH_CHECK(rows <= UINT32_MAX, "Gemma row count exceeds the CPU kernel ABI");
+  auto entry =
+      gemma_triton_entries[gemma_triton_index(hidden)][residual != nullptr].load(std::memory_order_acquire);
+  TORCH_CHECK(entry, "Prepare the Gemma Triton kernels before inference");
+  auto* state = residual ? residual->data_ptr() : output.data_ptr();
+  auto run_rows = [&](int64_t begin, int64_t end) {
+    for (int64_t row = begin; row < end; ++row)
+      entry(input.const_data_ptr(), weight.const_data_ptr(), state, output.data_ptr(), row, 0, 0, rows, 1, 1);
+  };
+  // Decode Q/K norm has a handful of 128-wide heads. Forking a team for
+  // these short rows cost more than their arithmetic in the first prototype.
+  if (hidden == 128 && rows <= 64)
+    run_rows(0, rows);
+  else
+    at::parallel_for(0, rows, 1, run_rows);
+}
+at::Tensor gemma_rmsnorm_triton(const at::Tensor& input, const at::Tensor& weight, double epsilon) {
+  validate_gemma_norm(input, weight);
+  auto output = at::empty_like(input);
+  execute_gemma_triton(output, input, weight, nullptr, epsilon);
+  return output;
+}
+void gemma_fused_add_rmsnorm_triton(at::Tensor& input,
+                                    at::Tensor& residual,
+                                    const at::Tensor& weight,
+                                    double epsilon) {
+  validate_gemma_norm(input, weight);
+  TORCH_CHECK(residual.device().is_cpu() && residual.scalar_type() == at::kBFloat16 &&
+                  residual.is_contiguous() && input.sizes() == residual.sizes(),
+              "Fused Gemma RMSNorm requires a matching contiguous BF16 residual");
+  execute_gemma_triton(input, input, weight, &residual, epsilon);
+}
+
 at::Tensor gdn_prefill_cpu(const at::Tensor& query,
                            const at::Tensor& key,
                            const at::Tensor& value,
@@ -1851,10 +1919,14 @@ at::Tensor gdn_conv1d_prefill_raw(const at::Tensor& input,
 }
 }  // namespace
 TORCH_LIBRARY(flag_gems_arm_gdn, m) {
+  m.def("register_gemma_triton_kernel(int hidden, bool fused, int address) -> ()", register_gemma_triton_kernel);
+  m.def("gemma_triton_fp_fusion() -> bool", gemma_triton_fp_fusion);
   m.def("gemma_rmsnorm(Tensor input, Tensor weight, float epsilon) -> Tensor");
   m.def("gemma_rmsnorm.raw(Tensor input, Tensor weight, float epsilon) -> Tensor");
   m.def("gemma_fused_add_rmsnorm(Tensor(a!) input, Tensor(b!) residual, Tensor weight, float epsilon) -> ()");
   m.def("gemma_fused_add_rmsnorm.raw(Tensor(a!) input, Tensor(b!) residual, Tensor weight, float epsilon) -> ()");
+  m.def("gemma_rmsnorm.triton(Tensor input, Tensor weight, float epsilon) -> Tensor");
+  m.def("gemma_fused_add_rmsnorm.triton(Tensor(a!) input, Tensor(b!) residual, Tensor weight, float epsilon) -> ()");
   m.def(
       "gdn_decode(Tensor A_log, Tensor a, Tensor b, Tensor dt_bias, Tensor query, Tensor key, Tensor value, "
       "Tensor(a!) initial_state, Tensor state_indices, bool use_qk_l2norm_in_kernel=True) -> Tensor");
@@ -1907,6 +1979,8 @@ TORCH_LIBRARY(flag_gems_arm_gdn, m) {
       "Tensor");
 }
 TORCH_LIBRARY_IMPL(flag_gems_arm_gdn, CPU, m) {
+  m.impl("gemma_rmsnorm.triton", gemma_rmsnorm_triton);
+  m.impl("gemma_fused_add_rmsnorm.triton", gemma_fused_add_rmsnorm_triton);
   m.impl("gemma_rmsnorm", gemma_rmsnorm_cpu);
   m.impl("gemma_rmsnorm.raw", gemma_rmsnorm_raw);
   m.impl("gemma_fused_add_rmsnorm", gemma_fused_add_rmsnorm_cpu);

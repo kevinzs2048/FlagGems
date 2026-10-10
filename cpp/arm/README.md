@@ -286,3 +286,26 @@ measurements exclude Python overhead and cannot substitute for public-entry
 or whole-model measurements. Keep benchmark samples and source/build hashes
 with the review evidence rather than hard-coding a machine's performance or
 CPU placement into the operator implementation.
+
+## Ordinary Triton Gemma norm
+
+`flag_gems.runtime.backend._arm.fused.gemma_norm.prepare_gemma_triton()`
+prepares ordinary CPU Triton kernels once, then exposes
+`gemma_rmsnorm.triton` and `gemma_fused_add_rmsnorm.triton` in the `gdn`
+Torch namespace. Arithmetic runs in Triton; C++ only validates tensors,
+allocates output, and launches cached entries through Torch's thread pool.
+No Python launcher or JIT-cache lookup occurs on each inference call.
+
+This specialization supports contiguous CPU BF16 input and weight, hidden
+sizes 128/1024/2048, epsilon 1e-6, and at most INT32_MAX elements. Input/weight
+views may have unaligned storage offsets. It preserves the native eight-lane
+BF16 NEON accumulation and four-lane reduction order, plus BF16 residual
+rounding before variance. Preparation checks the native vector layout and
+uses its compiler contraction policy. Unsupported configurations should use
+the existing native or CPU TLE overload rather than silently changing math.
+The compiled libraries remain owned by the Python preparation module.
+
+Short 128-wide Q/K normalization calls run serially to avoid a thread-team
+fork that costs more than their arithmetic. Larger calls use the configured
+Torch thread pool. CPU preparation and operator tests must use the same
+FlagTree compiler, native library, and Torch build as inference.
