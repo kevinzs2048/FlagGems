@@ -131,6 +131,33 @@ def test_arm_online_w8_chunk_packing(native):
         prepare_w8a8_weight(torch.full_like(weight,float('nan')))
 
 
+@pytest.mark.parametrize('rows', [1,16,512])
+@pytest.mark.parametrize('hidden', [13,128,1024,2048])
+@pytest.mark.parametrize('fused', [False,True])
+def test_arm_gemma_norm_forward_and_raw(native,raw,rows,hidden,fused):
+    torch.manual_seed(282+rows+hidden)
+    x = torch.randn(rows,hidden,dtype=torch.bfloat16)
+    residual = torch.randn_like(x)
+    weight = torch.randn(hidden,dtype=torch.bfloat16)*.1
+    source = (x+residual).float() if fused else x.float()
+    expected = source*torch.rsqrt(source.square().mean(-1,keepdim=True)+1e-6)*(weight.float()+1.)
+    ops,r = native('gdn'),native('gdn',raw=True)
+    if fused:
+        actual = x.clone()
+        state = residual.clone()
+        ops.gemma_fused_add_rmsnorm(actual,state,weight,1e-6)
+        other = x.clone()
+        other_state = residual.clone()
+        r.gemma_fused_add_rmsnorm(other,other_state,weight,1e-6)
+        assert torch.equal(state,x+residual)
+        assert torch.equal(state,other_state)
+    else:
+        actual = ops.gemma_rmsnorm(x,weight,1e-6)
+        other = r.gemma_rmsnorm(x,weight,1e-6)
+    assert torch.equal(actual,other)
+    torch.testing.assert_close(actual.float(),expected,rtol=.01,atol=.01)
+
+
 @pytest.mark.parametrize("rows", [1, 3, 16, 127, 512])
 @pytest.mark.parametrize("n,split", [(128, 0), (128, 64), (128, 128), (640, 0)])
 def test_arm_g32_shared_and_raw(native, raw, rows, n, split, monkeypatch):

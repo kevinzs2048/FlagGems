@@ -13,7 +13,7 @@ namespace flag_gems::arm {
 // CPU Triton ABI: one context pointer followed by program IDs and grid sizes.
 using RawKernel = void (*)(void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
 extern std::atomic<RawKernel> raw_kernel;
-extern std::atomic<RawKernel> dense_raw_kernels[2];
+extern std::atomic<RawKernel> dense_raw_kernels[3];
 struct RawInvocation {
   void (*invoke)(RawInvocation*) noexcept;
   std::exception_ptr error;

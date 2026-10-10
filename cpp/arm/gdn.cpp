@@ -1114,6 +1114,152 @@ at::Tensor gdn_rmsnorm_gated_cpu(const at::Tensor& input,
   return output;
 }
 
+void gemma_rmsnorm_rows(BFloat16* output,
+                        const BFloat16* input,
+                        const BFloat16* weight,
+                        BFloat16* residual,
+                        int64_t rows,
+                        int64_t hidden,
+                        float epsilon) {
+  constexpr int64_t kBFloatLanes = BFloatVec::size();
+  const int64_t row_grain = std::max<int64_t>(1, 32768 / hidden);
+  at::parallel_for(0, rows, row_grain, [&](int64_t begin, int64_t end) {
+    for (int64_t row = begin; row < end; ++row) {
+      const auto* input_row = input + row * hidden;
+      auto* output_row = output + row * hidden;
+      auto* residual_row = residual == nullptr ? nullptr : residual + row * hidden;
+      FloatVec sum0(0.0f);
+      FloatVec sum1(0.0f);
+      int64_t index = 0;
+      for (; index + kBFloatLanes <= hidden; index += kBFloatLanes) {
+        FloatVec x0;
+        FloatVec x1;
+        std::tie(x0, x1) = at::vec::convert_to_float(
+            BFloatVec::loadu(input_row + index));
+        if (residual_row != nullptr) {
+          FloatVec residual0;
+          FloatVec residual1;
+          std::tie(residual0, residual1) = at::vec::convert_to_float(
+              BFloatVec::loadu(residual_row + index));
+          const BFloatVec summed = at::vec::convert_from_float<BFloat16>(
+              x0 + residual0, x1 + residual1);
+          summed.store(residual_row + index);
+          std::tie(x0, x1) = at::vec::convert_to_float(summed);
+        }
+        sum0 = sum0 + x0 * x0;
+        sum1 = sum1 + x1 * x1;
+      }
+      float sum = at::vec::vec_reduce_all<float>(
+          [](const FloatVec& lhs, const FloatVec& rhs) { return lhs + rhs; },
+          sum0 + sum1);
+      for (; index < hidden; ++index) {
+        float value = static_cast<float>(input_row[index]);
+        if (residual_row != nullptr) {
+          residual_row[index] = BFloat16(
+              value + static_cast<float>(residual_row[index]));
+          value = static_cast<float>(residual_row[index]);
+        }
+        sum += value * value;
+      }
+      const FloatVec inv_rms(
+          1.0f / std::sqrt(sum / static_cast<float>(hidden) + epsilon));
+      const FloatVec one(1.0f);
+      const auto* source =
+          residual_row == nullptr ? input_row : residual_row;
+      index = 0;
+      for (; index + kBFloatLanes <= hidden; index += kBFloatLanes) {
+        FloatVec x0;
+        FloatVec x1;
+        FloatVec weight0;
+        FloatVec weight1;
+        std::tie(x0, x1) =
+            at::vec::convert_to_float(BFloatVec::loadu(source + index));
+        std::tie(weight0, weight1) = at::vec::convert_to_float(
+            BFloatVec::loadu(weight + index));
+        at::vec::convert_from_float<BFloat16>(
+            x0 * inv_rms * (weight0 + one),
+            x1 * inv_rms * (weight1 + one))
+            .store(output_row + index);
+      }
+      const float inv_rms_scalar =
+          1.0f / std::sqrt(sum / static_cast<float>(hidden) + epsilon);
+      for (; index < hidden; ++index) {
+        output_row[index] = BFloat16(
+            static_cast<float>(source[index]) * inv_rms_scalar *
+            (static_cast<float>(weight[index]) + 1.0f));
+      }
+    }
+  });
+}
+
+struct GemmaNormPlan {
+  BFloat16* output;
+  const BFloat16* input;
+  const BFloat16* weight;
+  BFloat16* residual;
+  int64_t rows, hidden;
+  float epsilon;
+  std::exception_ptr error;
+};
+}  // namespace
+extern "C" void flag_gems_arm_gemma_compute(uint64_t descriptor) noexcept {
+  auto& plan = *reinterpret_cast<GemmaNormPlan*>(descriptor);
+  try {
+    gemma_rmsnorm_rows(plan.output, plan.input, plan.weight, plan.residual,
+                      plan.rows, plan.hidden, plan.epsilon);
+  } catch (...) {
+    plan.error = std::current_exception();
+  }
+}
+namespace {
+void validate_gemma_norm(const at::Tensor& input, const at::Tensor& weight) {
+  TORCH_CHECK(input.device().is_cpu() && weight.device().is_cpu() &&
+      input.scalar_type() == at::kBFloat16 && weight.scalar_type() == at::kBFloat16 &&
+      input.dim() >= 1 && input.is_contiguous() && weight.is_contiguous() &&
+      weight.dim() == 1 && weight.numel() > 0 && input.size(-1) == weight.numel(),
+      "Gemma RMSNorm expects contiguous BF16 [...,hidden] input and [hidden] weight");
+}
+void execute_gemma_norm(at::Tensor& output, const at::Tensor& input,
+                        const at::Tensor& weight, at::Tensor* residual,
+                        double epsilon, bool raw) {
+  const int64_t hidden = weight.numel();
+  GemmaNormPlan plan {output.data_ptr<BFloat16>(), input.const_data_ptr<BFloat16>(),
+      weight.const_data_ptr<BFloat16>(), residual ? residual->data_ptr<BFloat16>() : nullptr,
+      input.numel()/hidden, hidden, static_cast<float>(epsilon), {}};
+  if (raw) flag_gems::arm::invoke_dense_compute(plan, 2);
+  else flag_gems_arm_gemma_compute(reinterpret_cast<uint64_t>(&plan));
+  if (plan.error) std::rethrow_exception(plan.error);
+}
+at::Tensor gemma_rmsnorm_impl(const at::Tensor& input, const at::Tensor& weight,
+                              double epsilon, bool raw) {
+  validate_gemma_norm(input, weight);
+  auto output = at::empty_like(input);
+  execute_gemma_norm(output, input, weight, nullptr, epsilon, raw);
+  return output;
+}
+at::Tensor gemma_rmsnorm_cpu(const at::Tensor& input, const at::Tensor& weight, double epsilon) {
+  return gemma_rmsnorm_impl(input, weight, epsilon, false);
+}
+at::Tensor gemma_rmsnorm_raw(const at::Tensor& input, const at::Tensor& weight, double epsilon) {
+  return gemma_rmsnorm_impl(input, weight, epsilon, true);
+}
+void gemma_fused_add_rmsnorm_impl(at::Tensor& input, at::Tensor& residual,
+                                 const at::Tensor& weight, double epsilon, bool raw) {
+  validate_gemma_norm(input, weight);
+  TORCH_CHECK(residual.device().is_cpu() && residual.scalar_type() == at::kBFloat16 &&
+      residual.is_contiguous() && input.sizes() == residual.sizes(),
+      "Fused Gemma RMSNorm requires a matching contiguous BF16 residual");
+  execute_gemma_norm(input, input, weight, &residual, epsilon, raw);
+}
+void gemma_fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual,
+                                const at::Tensor& weight, double epsilon) {
+  gemma_fused_add_rmsnorm_impl(input, residual, weight, epsilon, false);
+}
+void gemma_fused_add_rmsnorm_raw(at::Tensor& input, at::Tensor& residual,
+                                const at::Tensor& weight, double epsilon) {
+  gemma_fused_add_rmsnorm_impl(input, residual, weight, epsilon, true);
+}
+
 at::Tensor gdn_prefill_cpu(const at::Tensor& query,
                            const at::Tensor& key,
                            const at::Tensor& value,
@@ -1705,6 +1851,10 @@ at::Tensor gdn_conv1d_prefill_raw(const at::Tensor& input,
 }
 }  // namespace
 TORCH_LIBRARY(flag_gems_arm_gdn, m) {
+  m.def("gemma_rmsnorm(Tensor input, Tensor weight, float epsilon) -> Tensor");
+  m.def("gemma_rmsnorm.raw(Tensor input, Tensor weight, float epsilon) -> Tensor");
+  m.def("gemma_fused_add_rmsnorm(Tensor(a!) input, Tensor(b!) residual, Tensor weight, float epsilon) -> ()");
+  m.def("gemma_fused_add_rmsnorm.raw(Tensor(a!) input, Tensor(b!) residual, Tensor weight, float epsilon) -> ()");
   m.def(
       "gdn_decode(Tensor A_log, Tensor a, Tensor b, Tensor dt_bias, Tensor query, Tensor key, Tensor value, "
       "Tensor(a!) initial_state, Tensor state_indices, bool use_qk_l2norm_in_kernel=True) -> Tensor");
@@ -1757,6 +1907,10 @@ TORCH_LIBRARY(flag_gems_arm_gdn, m) {
       "Tensor");
 }
 TORCH_LIBRARY_IMPL(flag_gems_arm_gdn, CPU, m) {
+  m.impl("gemma_rmsnorm", gemma_rmsnorm_cpu);
+  m.impl("gemma_rmsnorm.raw", gemma_rmsnorm_raw);
+  m.impl("gemma_fused_add_rmsnorm", gemma_fused_add_rmsnorm_cpu);
+  m.impl("gemma_fused_add_rmsnorm.raw", gemma_fused_add_rmsnorm_raw);
   m.impl("gdn_decode", gdn_decode_cpu);
   m.impl("gdn_decode.raw", gdn_decode_raw);
   m.impl("gdn_conv1d_update", gdn_conv1d_update_cpu);

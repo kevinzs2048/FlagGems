@@ -4,7 +4,7 @@
 
 namespace flag_gems::arm {
 std::atomic<RawKernel> raw_kernel {nullptr};
-std::atomic<RawKernel> dense_raw_kernels[2] {};
+std::atomic<RawKernel> dense_raw_kernels[3] {};
 }  // namespace flag_gems::arm
 
 extern "C" void flag_gems_arm_register_raw_kernel(uint64_t address) noexcept {
@@ -20,7 +20,7 @@ extern "C" void flag_gems_arm_raw_dispatch(uint64_t descriptor) noexcept {
 }
 
 extern "C" void flag_gems_arm_register_dense_raw_kernel(uint32_t index, uint64_t address) noexcept {
-  if (index < 2)
+  if (index < 3)
     flag_gems::arm::dense_raw_kernels[index].store(reinterpret_cast<flag_gems::arm::RawKernel>(address),
                                                    std::memory_order_release);
 }

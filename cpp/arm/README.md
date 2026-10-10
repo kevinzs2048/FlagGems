@@ -6,6 +6,16 @@ and gated delta network (GDN) recurrence/convolution/normalization operators.
 Both Darwin AArch64 and Linux AArch64 are supported. The target is opt-in and
 does not change the default dispatcher or existing GPU builds.
 
+The `gdn` namespace also exposes `gemma_rmsnorm` and in-place
+`gemma_fused_add_rmsnorm`, including `.raw` overloads. They compute
+`x * inv_rms * (weight.float() + 1)` before the final BF16 cast. The fused
+operator rounds the residual sum to BF16 before computing its variance,
+and updates both input and residual in place. It retains the arithmetic of
+the validated ARM Gemma path; this rounding order can differ from a generic
+fused PyTorch norm. The host wrapper owns validation and output allocation;
+one cached CPU Triton entry invokes the common C++ compute plan. The native
+library and Raw helper must be rebuilt and deployed together.
+
 ## Build
 
 Use the same Python and Torch environment as inference. Set
