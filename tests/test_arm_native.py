@@ -57,6 +57,80 @@ def _a8(x):
     return code - zp[:, None], 1.0 / multiplier
 
 
+@pytest.mark.parametrize('backend', ['native', 'raw'])
+def test_arm_gdn_inference_abi(native, raw, monkeypatch, backend):
+    from flag_gems.runtime.backend._arm.gdn import inference
+    torch.manual_seed(417)
+    monkeypatch.setenv('FLAGGEMS_ARM_GDN_BACKEND',backend)
+    q = torch.randn(1,3,2,32,dtype=torch.bfloat16)*.1
+    k = torch.randn_like(q)*.1
+    v = torch.randn(1,3,4,16,dtype=torch.bfloat16)*.1
+    g = -torch.rand(1,3,4)
+    beta = torch.rand(1,3,4)
+    initial = torch.randn(2,4,16,32)*.01
+    starts = torch.tensor([0,1,3],dtype=torch.int32)
+    monkeypatch.setenv('FLAGGEMS_GDN_NATIVE_PREFILL','0')
+    expected, expected_state = inference.torch_chunk_gated_delta_rule(
+        q,k,v,g,beta,initial.clone(),True,cu_seqlens=starts)
+    monkeypatch.setenv('FLAGGEMS_GDN_NATIVE_PREFILL','1')
+    state = initial.clone()
+    output, final = inference.torch_chunk_gated_delta_rule(
+        q,k,v,g,beta,state,True,cu_seqlens=starts)
+    torch.testing.assert_close(output,expected,rtol=.01,atol=.001)
+    torch.testing.assert_close(final,expected_state,rtol=2e-5,atol=2e-6)
+    assert final.data_ptr() == state.data_ptr()
+
+
+def test_arm_gdn_inference_initial_state_optional(monkeypatch):
+    from flag_gems.runtime.backend._arm.gdn import inference
+    monkeypatch.setenv('FLAGGEMS_GDN_NATIVE_PREFILL','0')
+    q = torch.zeros(1,2,1,32,dtype=torch.bfloat16)
+    v = torch.ones(1,2,1,16,dtype=torch.bfloat16)
+    output,state = inference.torch_chunk_gated_delta_rule(
+        q,q,v,torch.zeros(1,2,1),torch.ones(1,2,1),None,True)
+    assert torch.count_nonzero(output) == 0
+    assert state.dtype == torch.float32 and state.shape == (1,1,16,32)
+
+
+def test_arm_gdn_noninplace_decode_preserves_input_state(native, monkeypatch):
+    from flag_gems.runtime.backend._arm.gdn import inference
+    torch.manual_seed(173)
+    q = torch.randn(1, 1, 2, 32, dtype=torch.bfloat16) * .1
+    k = torch.randn_like(q)
+    v = torch.randn(1, 1, 4, 16, dtype=torch.bfloat16)
+    initial = torch.randn(2, 4, 16, 32) * .01
+    args = (torch.zeros(4), torch.randn(1, 4), torch.randn(1, 4),
+            torch.zeros(4), q, k, v)
+    indices = torch.tensor([1], dtype=torch.int32)
+    monkeypatch.setenv('FLAGGEMS_GDN_NATIVE_DECODE', '0')
+    expected, expected_state = inference.torch_fused_sigmoid_gating_delta_rule_update(
+        *args, initial_state=initial.clone(), inplace_final_state=False,
+        ssm_state_indices=indices)
+    monkeypatch.setenv('FLAGGEMS_GDN_NATIVE_DECODE', '1')
+    state = initial.clone()
+    actual, final = inference.torch_fused_sigmoid_gating_delta_rule_update(
+        *args, initial_state=state, inplace_final_state=False, ssm_state_indices=indices)
+    assert torch.equal(state, initial)
+    assert final.data_ptr() != state.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(final, expected_state, rtol=0, atol=0)
+
+
+def test_arm_online_w8_chunk_packing(native):
+    from flag_gems.runtime.backend._arm.fused.w8a8_prepare import prepare_w8a8_weight
+    torch.manual_seed(731)
+    weight = torch.randn(20,64,dtype=torch.bfloat16)
+    weight[0].zero_()
+    values = weight.float()
+    scales = (values.abs().amax(-1)/127).clamp_min(1e-8)
+    codes = (values/scales[:,None]).round().clamp(-127,127).to(torch.int8)
+    expected = native('w8a8').pack(codes,scales,False)
+    for rows in (4,8,1024):
+        assert torch.equal(prepare_w8a8_weight(weight,chunk_rows=rows),expected)
+    with pytest.raises(ValueError,match='finite'):
+        prepare_w8a8_weight(torch.full_like(weight,float('nan')))
+
+
 @pytest.mark.parametrize("rows", [1, 3, 16, 127, 512])
 @pytest.mark.parametrize("n,split", [(128, 0), (128, 64), (128, 128), (640, 0)])
 def test_arm_g32_shared_and_raw(native, raw, rows, n, split, monkeypatch):
