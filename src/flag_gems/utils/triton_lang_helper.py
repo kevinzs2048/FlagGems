@@ -1334,6 +1334,21 @@ def _fallback_isfinite(x):
     return (x - x) == 0.0
 
 
+@triton.jit
+def _fallback_hypot(x, y):
+    # Scaling avoids overflow/underflow from squaring finite components.
+    ax = tl.abs(x)
+    ay = tl.abs(y)
+    high = tl.maximum(ax, ay)
+    low = tl.minimum(ax, ay)
+    denominator = tl.where(high == 0, 1.0, high)
+    ratio = low / denominator
+    value = high * tl.sqrt(1.0 + ratio * ratio)
+    value = tl.where((x != x) | (y != y), x + y, value)
+    # IEEE hypot(inf, nan) is inf, independent of argument order.
+    return tl.where((ax == float("inf")) | (ay == float("inf")), float("inf"), value)
+
+
 _FALLBACK_SYMBOLS = {
     "pow": _fallback_pow,
     "asin": _fallback_asin,
@@ -1342,6 +1357,7 @@ _FALLBACK_SYMBOLS = {
     "erfinv": _fallback_erfinv,
     "finitef": _fallback_isfinite,
     "floor": _fallback_floor,
+    "hypot": _fallback_hypot,
     "isfinited": _fallback_isfinite,
     "j0": _fallback_j0,
     "j1": _fallback_j1,
@@ -1408,6 +1424,7 @@ tl_extra_shim = _patch_missing_symbols(
         "floor",
         "gelu_none",
         "gelu_tanh",
+        "hypot",
         "isfinited",
         "isinf",
         "isnan",
