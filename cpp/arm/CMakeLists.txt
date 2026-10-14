@@ -58,13 +58,19 @@ if(FLAGGEMS_ARM_BITCODE_COMPILER)
 endif()
 
 option(FLAGGEMS_BUILD_ARM_KAI "Build Arm quantized GEMM and routed MoE" OFF)
-if(FLAGGEMS_BUILD_ARM_KAI)
+option(FLAGGEMS_BUILD_ARM_STANDALONE "Build independent W8A8 and GDN without KleidiAI" OFF)
+if(FLAGGEMS_BUILD_ARM_KAI AND FLAGGEMS_BUILD_ARM_STANDALONE)
+  message(FATAL_ERROR "Choose either ARM_KAI or ARM_STANDALONE")
+endif()
+if(FLAGGEMS_BUILD_ARM_KAI OR FLAGGEMS_BUILD_ARM_STANDALONE)
+ if(FLAGGEMS_BUILD_ARM_KAI)
   set(KLEIDIAI_ROOT "" CACHE PATH "KleidiAI 1.29 source/include directory")
   set(KLEIDIAI_LIBRARY "" CACHE FILEPATH "KleidiAI static library")
   if(NOT EXISTS "${KLEIDIAI_ROOT}/kai/kai_common.h" OR
      NOT EXISTS "${KLEIDIAI_LIBRARY}")
     message(FATAL_ERROR "Arm KAI operators require KLEIDIAI_ROOT and KLEIDIAI_LIBRARY")
   endif()
+ endif()
   find_package(OpenMP REQUIRED)
   # Torch ships its own OpenMP runtime. Linking another pool can invalidate
   # the thread policy and nested-parallel guards used by these operators.
@@ -79,12 +85,20 @@ if(FLAGGEMS_BUILD_ARM_KAI)
     message(FATAL_ERROR "Expected one Torch OpenMP runtime, found: ${_torch_omp}")
   endif()
   separate_arguments(_omp_compile_flags NATIVE_COMMAND "${OpenMP_CXX_FLAGS}")
-  add_library(flag_gems_arm_native SHARED
-    raw_dispatch.cpp g32.cpp w8a8.cpp moe_prepack.cpp moe_streamed.cpp moe_prefill.cpp
-    gdn.cpp conv_prefill.cpp silu_mul_a8_pack.cpp)
-  target_include_directories(flag_gems_arm_native PRIVATE "${KLEIDIAI_ROOT}")
+  if(FLAGGEMS_BUILD_ARM_STANDALONE)
+    add_library(flag_gems_arm_native SHARED
+      raw_dispatch.cpp w8a8_standalone.cpp gdn.cpp conv_prefill.cpp silu_mul_a8_pack.cpp)
+    set_source_files_properties(w8a8_standalone.cpp PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
+    set(_arm_external_libraries)
+  else()
+    add_library(flag_gems_arm_native SHARED
+      raw_dispatch.cpp g32.cpp w8a8.cpp moe_prepack.cpp moe_streamed.cpp moe_prefill.cpp
+      gdn.cpp conv_prefill.cpp silu_mul_a8_pack.cpp)
+    target_include_directories(flag_gems_arm_native PRIVATE "${KLEIDIAI_ROOT}")
+    set(_arm_external_libraries "${KLEIDIAI_LIBRARY}")
+  endif()
   target_link_libraries(flag_gems_arm_native PRIVATE
-    Torch::Torch "${_torch_omp}" "${KLEIDIAI_LIBRARY}" ${CMAKE_DL_LIBS})
+    Torch::Torch "${_torch_omp}" ${_arm_external_libraries} ${CMAKE_DL_LIBS})
   target_compile_options(flag_gems_arm_native PRIVATE ${_omp_compile_flags})
   target_compile_options(flag_gems_arm_native PRIVATE -O3 -ffp-contract=off)
   # GDN's historical recurrence uses compiler-contractible multiply/add

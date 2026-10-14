@@ -33,7 +33,10 @@ class _RawOps:
 
 @lru_cache(maxsize=8)
 def arm_native_ops(group, *, raw=False):
-    """Return a cached operator namespace; build FLAGGEMS_BUILD_ARM_KAI=ON.
+    """Return a cached operator namespace from an Arm inference build.
+
+    ARM_STANDALONE builds W8A8/GDN without KleidiAI; ARM_KAI also builds
+    groupwise W4/MoE. Standalone packed weights must not be passed to KAI.
 
     ``raw=True`` requires the CPU TLE compiler and initializes compiled entries
     once. Call before inference workers start and cache the needed operator.
@@ -52,7 +55,7 @@ def arm_native_ops(group, *, raw=False):
                 else list(directory.glob("libflag_gems_arm_native.*"))
             )
             if len(paths) != 1 or not paths[0].is_file():
-                raise RuntimeError("Build and install FLAGGEMS_BUILD_ARM_KAI=ON first")
+                raise RuntimeError("Build and install ARM_STANDALONE=ON or ARM_KAI=ON first")
             # C ABI symbols must be visible when Triton loads its compiled DSO.
             _library = (paths[0], ctypes.CDLL(str(paths[0]), mode=ctypes.RTLD_GLOBAL))
     if raw:

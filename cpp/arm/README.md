@@ -18,6 +18,46 @@ library and Raw helper must be rebuilt and deployed together.
 
 ## Build
 
+### Independent W8A8 / GDN build
+
+For the MiniCPM-V-4.7-1B W8A8 CPU path, use
+`FLAGGEMS_BUILD_ARM_STANDALONE=ON` and `FLAGGEMS_BUILD_ARM_KAI=OFF`.
+No KleidiAI headers, library, download, or SDK mount is required. This target
+builds the FlagGems-owned W8A8 packing/compute and GDN/Norm routines. It excludes
+W4 G32 and routed MoE; it does not claim to remove their existing dependencies.
+
+W8 uses dynamic asymmetric per-token INT8 with a zero point. Weight packing
+stores four channels per block, INT32 channel sums and FP32 scales. Decode
+uses Neon SDOT. Four-row prefill tiles also use SDOT by default. Independent
+I8MM is an explicit experiment (`FLAGGEMS_STANDALONE_PREFILL_I8MM=1`), not an
+assumed speedup. Each activation row is quantized once, contiguous N stripes
+reuse the prepared weight layout, and a cached CPU TLE Raw entry invokes the
+whole compute plan. No KAI symbols participate in this implementation.
+
+The arithmetic remains compiled C++/Neon inside TLE Raw. This is not a claim
+that Raw removed native source compilation. The ordinary CPU Triton reference
+in `w8a8_standalone_triton.py` implements quantization and GEMV without an
+external microkernel, for correctness and measured performance comparisons.
+It is not selected as the tuned default.
+
+```sh
+cmake -S cpp -B build/arm-standalone \
+  -DFLAGGEMS_BUILD_C_EXTENSIONS=OFF \
+  -DFLAGGEMS_BUILD_ARM_NATIVE=ON \
+  -DFLAGGEMS_BUILD_ARM_KAI=OFF \
+  -DFLAGGEMS_BUILD_ARM_STANDALONE=ON \
+  -DFLAGGEMS_INSTALL=ON \
+  -DPython_EXECUTABLE=/path/to/python
+cmake --build build/arm-standalone -j4
+cmake --install build/arm-standalone --prefix /path/to/site-packages
+```
+
+Use `arm_native_ops("w8a8", raw=True)` and the existing GDN Raw entry. The
+selected library supplies the weight ABI. Restart the process when changing
+the library and never reuse packed weights from the other build variant.
+
+### KleidiAI W4/MoE build (separate opt-in)
+
 Use the same Python and Torch environment as inference. Set
 `FLAGGEMS_VENDOR=arm` to select the CPU backend, including on Linux systems
 without an accelerator device. The dense kernels

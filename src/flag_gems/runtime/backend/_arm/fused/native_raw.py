@@ -56,11 +56,13 @@ def initialize_native_raw(library_path):
             ("flag_gems_arm_g32_compute", "flag_gems_arm_w8_compute",
              "flag_gems_arm_gemma_compute")
         ):
+            if not hasattr(native, symbol):
+                continue  # Standalone W8/GDN build intentionally excludes G32/MoE.
             entry = _arm_native_raw_kernel.warmup(dummy, SYMBOL=symbol, grid=(1,))
             dso = ctypes.CDLL(entry.metadata_group[entry.name + ".so"])
             pointer = ctypes.cast(getattr(dso, entry.name), ctypes.c_void_p).value
-            dense_owners.append((entry, dso, pointer))
+            dense_owners.append((index, entry, dso, pointer))
         _owners = (str(library_path), native, compiled, kernel, dense_owners)
         register(address)
-        for index, (_, _, pointer) in enumerate(dense_owners):
+        for index, _, _, pointer in dense_owners:
             register_dense(index, pointer)

@@ -7,10 +7,11 @@ from .native_ops import arm_native_ops
 
 
 def prepare_w8a8_weight(weight, *, chunk_rows=1024):
-    """Per-channel symmetric W8; KAI execution uses dynamic asymmetric A8.
+    """Per-channel symmetric W8; execution uses dynamic asymmetric A8.
 
     This is runtime weight preparation, not a checkpoint generation script.
-    Only one chunk is promoted to FP32 at a time. Return the Neon qsi8cxp ABI.
+    Only one chunk is promoted to FP32 at a time. The selected Arm library
+    owns its four-channel packed ABI; standalone and KAI layouts differ.
     """
     if (weight.device.type != 'cpu' or weight.ndim != 2
             or not weight.is_floating_point()):
