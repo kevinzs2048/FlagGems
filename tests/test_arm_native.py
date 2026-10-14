@@ -45,7 +45,7 @@ def raw(native):
 def _a8(x):
     low = torch.minimum(x.amin(-1), torch.zeros(x.shape[0]))
     high = torch.maximum(x.amax(-1), torch.zeros(x.shape[0]))
-    multiplier = torch.where(high == low, 1.0, 255.0 / (high - low))
+    multiplier = torch.where(high == low, 1.0, torch.div(torch.full_like(low,255.0),high-low))
     use_min = -128.0 + low * multiplier + 127.0 + high * multiplier > 0
     zp = (
         torch.where(use_min, -128.0 - low * multiplier, 127.0 - high * multiplier)
@@ -54,7 +54,27 @@ def _a8(x):
     )
     scaled = x * multiplier[:, None]
     code = (scaled.sign() * (scaled.abs() + 0.5).floor() + zp[:, None]).clamp(-128, 127)
-    return code - zp[:, None], 1.0 / multiplier
+    return code - zp[:, None], torch.div(torch.ones_like(multiplier),multiplier)
+
+
+@pytest.mark.parametrize('rows,n,k', [(1,64,128),(3,64,128),(16,384,1024),(512,128,1024)])
+@pytest.mark.parametrize('i8mm', ['0','1'])
+def test_arm_standalone_w8_quantization(native, raw, monkeypatch, rows, n, k, i8mm):
+    ops=native('w8a8',raw=True)
+    if not hasattr(ops,'implementation') or ops.implementation()!='standalone-neon':
+        pytest.skip('requires ARM_STANDALONE build')
+    monkeypatch.setenv('FLAGGEMS_STANDALONE_PREFILL_I8MM',i8mm)
+    torch.manual_seed(781+rows)
+    x=torch.randn(rows,k).bfloat16().float()
+    if rows>1:x[0].zero_()
+    w=torch.randint(-127,128,(n,k),dtype=torch.int8)
+    scales=torch.rand(n)*0.01+0.001
+    q,sx=_a8(x)
+    expected=(q.double()@w.double().T).float()*(sx[:,None]*scales[None,:])
+    packed=ops.pack(w,scales,False)
+    out=ops.linear(x,packed,n,False,32,128)
+    torch.testing.assert_close(out,expected,rtol=2e-5,atol=2e-5)
+    assert torch.equal(out,native('w8a8').linear(x,packed,n,False,32,128))
 
 
 @pytest.mark.parametrize('backend', ['native', 'raw'])

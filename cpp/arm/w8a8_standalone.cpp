@@ -167,6 +167,7 @@ at::Tensor linear(const at::Tensor& x,const at::Tensor& w,int64_t n,bool sme,int
 at::Tensor linear_raw(const at::Tensor& x,const at::Tensor& w,int64_t n,bool sme,int64_t mr,int64_t nr){return linear_impl(x,w,n,sme,mr,nr,true);}
 }
 TORCH_LIBRARY(flag_gems_arm_w8a8,m){
+  m.def("implementation() -> str", [](){return std::string("standalone-neon");});
   m.def("pack(Tensor weight, Tensor scales, bool sme) -> Tensor");
   m.def("linear(Tensor input, Tensor packed, int n, bool sme, int tile_rows, int tile_cols) -> Tensor");
   m.def("linear.raw(Tensor input, Tensor packed, int n, bool sme, int tile_rows, int tile_cols) -> Tensor");
