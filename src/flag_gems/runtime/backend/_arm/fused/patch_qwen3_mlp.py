@@ -40,7 +40,13 @@ import types
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra.cpu.tle_ops import fused_mlp as _tle_fused_mlp
+
+try:
+    from triton.language.extra.cpu.tle_ops import fused_mlp as _tle_fused_mlp
+except ImportError:
+    # CPU compiler releases expose different optional TLE operations.
+    # A missing Qwen fusion must not prevent importing the Arm backend.
+    _tle_fused_mlp = None
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +94,8 @@ class FusedMLPWrapper:
         self.act_fn = act_fn
 
         self._fused = (
-            hasattr(gate_linear, "_packed")
+            _tle_fused_mlp is not None
+            and hasattr(gate_linear, "_packed")
             and hasattr(up_linear, "_packed")
             and hasattr(gate_linear, "_w_scale")
             and hasattr(up_linear, "_w_scale")
@@ -152,6 +159,8 @@ def patch_qwen3_mlp(model) -> int:
     Returns number of MLP instances patched. Safe to call multiple times —
     each instance is patched once (tracked via id).
     """
+    if _tle_fused_mlp is None:
+        return 0
     mlp_classes = _get_qwen_mlp_classes()
     if not mlp_classes:
         logger.debug(
