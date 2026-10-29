@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from ..tle_raw.native_ops import arm_native_ops  # noqa: F401
 from ..tle_raw.silu_mul_a8_pack_native import silu_mul_a8_pack_native  # noqa: F401
 from .fused_add_rms_norm import fused_add_rms_norm  # noqa: F401
 from .patch_qwen3_mlp import patch_qwen3_mlp, unpatch_qwen3_mlp  # noqa: F401
 
 __all__ = [
+    "arm_native_ops",
     "fused_add_rms_norm",
     "patch_qwen3_mlp",
     "silu_mul_a8_pack_native",

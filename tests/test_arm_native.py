@@ -22,21 +22,19 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def native():
-    from flag_gems.runtime.backend._arm.tle_raw.silu_mul_a8_pack_native import (
-        _ensure_native_library,
-    )
+    from flag_gems.runtime.backend._arm.fused import arm_native_ops
 
-    directory = (
+    backend = (
         Path(__file__).resolve().parents[1]
         / "src/flag_gems/runtime/backend/_arm/tle_raw/lib"
     )
-    if not os.getenv("FLAGGEMS_ARM_SILU_LIBRARY") and not list(
-        directory.glob("libflag_gems_arm_silu_native.*")
+    if not os.environ.get("FLAGGEMS_ARM_NATIVE_LIBRARY") and not list(
+        backend.glob("libflag_gems_arm_native.*")
     ):
-        if os.getenv("FLAGGEMS_ARM_REQUIRE_NATIVE_TESTS") == "1":
-            pytest.fail("Strict Arm test job requires a built SiLU leaf library")
-        pytest.skip("build the optional Arm SiLU leaf library")
-    _ensure_native_library()
+        if os.environ.get("FLAGGEMS_ARM_REQUIRE_NATIVE_TESTS") == "1":
+            pytest.fail("Strict Arm test job requires a built native library")
+        pytest.skip("build FLAGGEMS_BUILD_ARM_KAI=ON")
+    return arm_native_ops
 
 
 @pytest.fixture
@@ -49,7 +47,121 @@ def raw(native):
         if os.environ.get("FLAGGEMS_ARM_REQUIRE_NATIVE_TESTS") == "1":
             pytest.fail("Strict Arm test job requires the scalar CPU Raw compiler")
         pytest.skip("requires CPU scalar native-call support with void results")
+    native("w8a8", raw=True)
     return native
+
+
+def _a8(x):
+    low = torch.minimum(x.amin(-1), torch.zeros(x.shape[0]))
+    high = torch.maximum(x.amax(-1), torch.zeros(x.shape[0]))
+    multiplier = torch.where(
+        high == low, 1.0, torch.div(torch.full_like(low, 255.0), high - low)
+    )
+    use_min = -128.0 + low * multiplier + 127.0 + high * multiplier > 0
+    zp = (
+        torch.where(use_min, -128.0 - low * multiplier, 127.0 - high * multiplier)
+        .clamp(-128, 127)
+        .round()
+    )
+    scaled = x * multiplier[:, None]
+    code = (scaled.sign() * (scaled.abs() + 0.5).floor() + zp[:, None]).clamp(-128, 127)
+    return code - zp[:, None], torch.div(torch.ones_like(multiplier), multiplier)
+
+
+@pytest.mark.parametrize(
+    "rows,n,k", [(1, 64, 128), (3, 64, 128), (16, 384, 1024), (512, 128, 1024)]
+)
+@pytest.mark.parametrize("i8mm", ["0", "1"])
+def test_arm_standalone_w8_quantization(native, raw, monkeypatch, rows, n, k, i8mm):
+    ops = native("w8a8", raw=True)
+    if not hasattr(ops, "implementation") or ops.implementation() != "standalone-neon":
+        pytest.skip("requires ARM_STANDALONE build")
+    monkeypatch.setenv("FLAGGEMS_STANDALONE_PREFILL_I8MM", i8mm)
+    torch.manual_seed(781 + rows)
+    x = torch.randn(rows, k).bfloat16().float()
+    if rows > 1:
+        x[0].zero_()
+    w = torch.randint(-127, 128, (n, k), dtype=torch.int8)
+    scales = torch.rand(n) * 0.01 + 0.001
+    q, sx = _a8(x)
+    expected = (q.double() @ w.double().T).float() * (sx[:, None] * scales[None, :])
+    packed = ops.pack(w, scales, False)
+    out = ops.linear(x, packed, n, False, 32, 128)
+    torch.testing.assert_close(out, expected, rtol=2e-5, atol=2e-5)
+    assert torch.equal(out, native("w8a8").linear(x, packed, n, False, 32, 128))
+    from flag_gems.runtime.backend._arm.fused.w8a8_standalone_triton import (
+        linear_triton,
+    )
+
+    torch.testing.assert_close(
+        linear_triton(x, packed, n), expected, rtol=2e-5, atol=2e-5
+    )
+
+
+def test_arm_online_w8_chunk_packing(native):
+    from flag_gems.runtime.backend._arm.fused.w8a8_prepare import prepare_w8a8_weight
+
+    torch.manual_seed(731)
+    weight = torch.randn(20, 64, dtype=torch.bfloat16)
+    weight[0].zero_()
+    values = weight.float()
+    scales = (values.abs().amax(-1) / 127).clamp_min(1e-8)
+    codes = (values / scales[:, None]).round().clamp(-127, 127).to(torch.int8)
+    expected = native("w8a8").pack(codes, scales, False)
+    for rows in (4, 8, 1024):
+        assert torch.equal(prepare_w8a8_weight(weight, chunk_rows=rows), expected)
+    with pytest.raises(ValueError, match="finite"):
+        prepare_w8a8_weight(torch.full_like(weight, float("nan")))
+
+
+def test_arm_raw_errors_do_not_poison_entry(native, raw):
+    ops = native("w8a8", raw=True)
+    with pytest.raises(RuntimeError, match="Expected contiguous FP32"):
+        ops.linear(
+            torch.ones(1, 32, dtype=torch.bfloat16),
+            torch.empty(1, dtype=torch.uint8),
+            8,
+            False,
+            32,
+            128,
+        )
+    w = torch.zeros(8, 32, dtype=torch.int8)
+    scales = torch.ones(8)
+    packed = native("w8a8").pack(w, scales, False)
+    assert torch.equal(
+        ops.linear(torch.ones(1, 32), packed, 8, False, 32, 128), torch.zeros(1, 8)
+    )
+
+    # Bypass the host shape guard to exercise status writes through the actual
+    # compiled void Raw entry, including recovery after a native error.
+    from flag_gems.runtime.backend._arm.tle_raw import silu_a8_raw
+
+    silu_a8_raw.initialize_silu_a8_raw()
+    _, compiled, library = silu_a8_raw._owners[:3]
+    gate_up = torch.zeros(1, 64)
+    for scalar in (False, True):
+        name = compiled.metadata.single_program_name if scalar else compiled.name
+        entry = getattr(library, name)
+        entry.restype = ctypes.c_int32 if scalar else None
+        entry.argtypes = [ctypes.c_void_p] * 2 + [ctypes.c_int32] * 4
+        if not scalar:
+            entry.argtypes += [ctypes.POINTER(ctypes.c_int32)] + [ctypes.c_int32] * 6
+        output = torch.full((40,), 165, dtype=torch.uint8)
+        status = ctypes.c_int32(123)
+
+        def call(k, output=output, scalar=scalar, status=status, entry=entry):
+            args = [gate_up.data_ptr(), output.data_ptr(), 1, 64, k, 1]
+            if scalar:
+                status.value = entry(*args)
+            else:
+                entry(*args, ctypes.byref(status), 0, 0, 0, 1, 1, 1)
+
+        call(31)
+        assert status.value == -1
+        assert torch.all(output == 165)
+        call(32)
+        assert status.value == 0
+        assert torch.equal(output, torch.ops.flag_gems_arm_silu_native.pack(gate_up, 1))
 
 
 def test_arm_silu_raw_rejects_old_single_program_abi(native, raw, monkeypatch):
@@ -283,6 +395,43 @@ def test_arm_silu_boundary_leaf_ownership(native, raw):
             output.fill_(165)
             assert leaf(x.data_ptr(), output.data_ptr(), rows, 137, 63, mr) == -1
             assert torch.all(output == 165)
+
+
+@pytest.mark.parametrize("invalid", ["dtype", "stride", "device"])
+def test_arm_standalone_triton_rejects_invalid_packed(invalid):
+    from flag_gems.runtime.backend._arm.fused.w8a8_standalone_triton import (
+        linear_triton,
+    )
+
+    x = torch.zeros((1, 32), dtype=torch.float32)
+    size = 4 * 32 + 48
+    if invalid == "dtype":
+        packed = torch.zeros(size, dtype=torch.float32)
+    elif invalid == "stride":
+        packed = torch.zeros(size * 2, dtype=torch.uint8)[::2]
+    else:
+        packed = torch.empty(size, dtype=torch.uint8, device="meta")
+    with pytest.raises(ValueError, match="contiguous CPU uint8"):
+        linear_triton(x, packed, 4)
+
+
+@pytest.mark.parametrize("backend", ["native", "raw"])
+def test_arm_w8_fake_schema_and_compile(native, raw, backend):
+    ops = native("w8a8", raw=backend == "raw")
+    x = torch.randn((3, 128), dtype=torch.float32)
+    weight = torch.randint(-127, 128, (64, 128), dtype=torch.int8)
+    packed = ops.pack(weight, torch.ones(64), False)
+    operation = ops.linear
+    if backend == "native":
+        operation = operation.default
+    args = (x, packed, 64, False, 32, 128)
+    torch.library.opcheck(operation, args)
+    compiled = torch.compile(
+        lambda a, b: operation(a, b, 64, False, 32, 128),
+        backend="aot_eager",
+        fullgraph=True,
+    )
+    assert torch.equal(compiled(x, packed), operation(*args))
 
 
 def test_arm_silu_metadata_registration_stays_out_of_compute(native, raw, monkeypatch):

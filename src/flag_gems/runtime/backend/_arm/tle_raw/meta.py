@@ -14,6 +14,12 @@ _lock = threading.Lock()
 _registered = set()
 
 
+def _linear(input, packed, n, *options):
+    torch._check(input.ndim == 2)
+    torch._check(n > 0)
+    return input.new_empty((input.shape[0], n), dtype=torch.float32)
+
+
 def _silu_pack(gate_up, mr):
     torch._check(gate_up.ndim == 2)
     torch._check(mr == 1 or mr == 4)
@@ -28,7 +34,10 @@ def _silu_pack(gate_up, mr):
 
 def register_arm_fake_kernels():
     """Register schemas present in the currently loaded optional library."""
-    groups = {"flag_gems_arm_silu_native": {"pack": _silu_pack, "pack_raw": _silu_pack}}
+    groups = {
+        "flag_gems_arm_w8a8": {"linear": _linear},
+        "flag_gems_arm_silu_native": {"pack": _silu_pack, "pack_raw": _silu_pack},
+    }
     with _lock:
         for namespace, operations in groups.items():
             for name, implementation in operations.items():

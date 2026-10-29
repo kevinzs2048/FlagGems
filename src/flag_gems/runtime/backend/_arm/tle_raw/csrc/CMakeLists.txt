@@ -98,6 +98,33 @@ if(FLAGGEMS_ARM_BITCODE_COMPILER)
   endif()
 endif()
 
+option(FLAGGEMS_BUILD_ARM_STANDALONE "Build independent W8A8" OFF)
+if(FLAGGEMS_BUILD_ARM_STANDALONE)
+  find_package(OpenMP REQUIRED)
+  # Torch ships its own OpenMP runtime. Linking another pool can invalidate
+  # the thread policy and nested-parallel guards used by these operators.
+  get_target_property(_torch_includes Torch::Torch INTERFACE_INCLUDE_DIRECTORIES)
+  list(GET _torch_includes 0 _torch_include)
+  get_filename_component(_torch_directory "${_torch_include}" DIRECTORY)
+  file(GLOB _torch_omp
+    "${_torch_directory}/lib/libomp.dylib"
+    "${_torch_directory}/lib/libgomp*.so*")
+  list(LENGTH _torch_omp _torch_omp_count)
+  if(NOT _torch_omp_count EQUAL 1)
+    message(FATAL_ERROR "Expected one Torch OpenMP runtime, found: ${_torch_omp}")
+  endif()
+  separate_arguments(_omp_compile_flags NATIVE_COMMAND "${OpenMP_CXX_FLAGS}")
+  add_library(flag_gems_arm_native SHARED raw_dispatch.cpp w8a8_standalone.cpp silu_mul_a8_pack.cpp)
+  set_source_files_properties(w8a8_standalone.cpp PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
+  target_link_libraries(flag_gems_arm_native PRIVATE Torch::Torch "${_torch_omp}" ${CMAKE_DL_LIBS})
+  target_compile_options(flag_gems_arm_native PRIVATE ${_omp_compile_flags} -O3 -ffp-contract=off)
+  if(UNIX AND NOT APPLE)
+    target_link_options(flag_gems_arm_native PRIVATE "LINKER:-Bsymbolic-functions")
+  endif()
+  if(FLAGGEMS_INSTALL)
+    install(TARGETS flag_gems_arm_native LIBRARY DESTINATION flag_gems/runtime/backend/_arm/tle_raw/lib)
+  endif()
+endif()
 if(FLAGGEMS_INSTALL)
   install(TARGETS flag_gems_arm_silu_native
     LIBRARY DESTINATION flag_gems/runtime/backend/_arm/tle_raw/lib)
