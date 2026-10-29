@@ -8,6 +8,7 @@ Mutation and aliasing stay in the C++ schemas; fake kernels never read data.
 """
 
 import threading
+
 import torch
 
 _lock = threading.Lock()
@@ -33,6 +34,7 @@ def _value_prefill(query, key, value, *args):
 
 
 def _mutating(*args, **kwargs):
+    # The real operator's schema declares each mutated tensor.
     return None
 
 
@@ -48,10 +50,39 @@ def _silu_pack(gate_up, mr):
     )
 
 
+def _moe(input, routing, w1, w2, h, *args):
+    return input.new_empty((input.shape[0], h), dtype=torch.float32)
+
+
+def _moe_decode(input, ids, gates, w1, w2, h, *args):
+    return input.new_empty((1, h), dtype=torch.float32)
+
+
 def register_arm_fake_kernels():
     """Register schemas present in the currently loaded optional library."""
     groups = {
-        "flag_gems_arm_w8a8": {"linear": _linear},
+        "flag_gems_arm_w8a8": {
+            "linear": _linear,
+        },
+        "flag_gems_arm_g32": {
+            "linear": _linear,
+            "moe_decode": _moe_decode,
+            **{
+                name: _moe
+                for name in (
+                    "moe_decode_routed",
+                    "moe_decode_fused",
+                    "moe_prefill_routed",
+                    "moe_prefill_fused",
+                    "moe_prefill_adaptive",
+                    "moe_prefill_balanced",
+                )
+            },
+        },
+        "flag_gems_arm_moe_prepack": {
+            "moe": _moe,
+            "moe_fused": _moe,
+        },
         "flag_gems_arm_gdn": {
             "gemma_rmsnorm": _same_input,
             "gemma_fused_add_rmsnorm": _mutating,
@@ -63,7 +94,10 @@ def register_arm_fake_kernels():
             "gdn_packed_decode": _mutating,
             "gdn_packed_decode_norm": _mutating,
         },
-        "flag_gems_arm_silu_native": {"pack": _silu_pack, "pack_raw": _silu_pack},
+        "flag_gems_arm_silu_native": {
+            "pack": _silu_pack,
+            "pack_raw": _silu_pack,
+        },
     }
     with _lock:
         for namespace, operations in groups.items():

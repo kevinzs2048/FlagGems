@@ -6,7 +6,7 @@ import ctypes
 import inspect
 import os
 import platform
-
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -270,6 +270,123 @@ def test_arm_gemma_norm_forward_and_raw(native, raw, rows, hidden, fused):
     torch.testing.assert_close(actual.float(), expected, rtol=0.01, atol=0.01)
 
 
+@pytest.mark.parametrize("rows", [1, 3, 16, 127, 512])
+@pytest.mark.parametrize("n,split", [(128, 0), (128, 64), (128, 128), (640, 0)])
+def test_arm_g32_linear_and_raw(native, raw, rows, n, split, monkeypatch):
+    torch.manual_seed(276 + rows)
+    ops = native("w4a8_g32")
+    k = 96
+    x = torch.randn(rows, k)
+    w = torch.randint(-8, 8, (n, k), dtype=torch.int8)
+    scale = (0.01 + torch.rand(n, k // 32) * 0.02).bfloat16()
+    try:
+        packed = ops.pack(w, scale, split)[0]
+    except RuntimeError as error:
+        if split and "ISA is unavailable" in str(error):
+            pytest.skip("SME2 unavailable")
+        raise
+    q, sx = _a8(x)
+    accum = torch.einsum(
+        "mgk,ngk->mng", q.reshape(rows, -1, 32), w.float().reshape(n, -1, 32)
+    )
+    expected = (accum * scale.float()[None]).sum(-1) * sx[:, None]
+    args = [x, packed, n, split, 8 if n == 640 else 4, 2]
+    out = ops.linear(*args)
+    torch.testing.assert_close(out, expected, rtol=2e-4, atol=2e-5)
+    assert torch.equal(out, native("w4a8_g32", raw=True).linear(*args))
+
+    if 0 < split < n and platform.system() == "Darwin":
+        monkeypatch.setenv("FLAGGEMS_ARM_APPLE_18CPU_CLUSTER_POLICY", "1")
+        cluster_args = [*args[:-1], -1]
+        assert torch.equal(out, ops.linear(*cluster_args))
+        assert torch.equal(out, native("w4a8_g32", raw=True).linear(*cluster_args))
+
+
+@pytest.mark.parametrize("actual_limit", [1, 2])
+def test_arm_reduced_team_subprocess(native, raw, actual_limit):
+    # OpenMP reads this limit when its runtime initializes. Run the existing
+    # independent numerical tests in a fresh process, including explicit
+    # SME/Neon partitioning where available.
+    # Convolution also covers empty sequences, tails and cache updates when
+    # its static OpenMP loop receives fewer workers than requested.
+    environment = dict(os.environ)
+    environment["OMP_THREAD_LIMIT"] = str(actual_limit)
+    environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    environment["PYTHONPATH"] = os.pathsep.join(map(str, sys.path))
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "--tb=short",
+            str(Path(__file__).resolve()),
+            "-k",
+            (
+                "g32_linear_and_raw or conv_prefill_state_and_empty_ranges "
+                "or conv_update_triton_state_and_tail"
+            ),
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=90,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("rows,n,k", [(1, 17, 96), (3, 17, 96), (16, 64, 128)])
+@pytest.mark.parametrize("sme", [False, True])
+def test_arm_w8_tail_and_quantization(native, raw, rows, n, k, sme):
+    torch.manual_seed(976 + rows)
+    ops = native("w8a8")
+    x = torch.randn(rows, k)
+    x[0].zero_()
+    w = torch.randint(-127, 128, (n, k), dtype=torch.int8)
+    scales = torch.rand(n) * 0.02 + 0.001
+    try:
+        packed = ops.pack(w, scales, sme)
+    except RuntimeError as error:
+        if sme and "ISA is unavailable" in str(error):
+            pytest.skip("SME2 unavailable")
+        raise
+    q, sx = _a8(x)
+    expected = (q @ w.float().t()) * sx[:, None] * scales[None]
+    args = [x, packed, n, sme, 32, 128]
+    out = ops.linear(*args)
+    torch.testing.assert_close(out, expected, rtol=2e-4, atol=2e-5)
+    assert torch.equal(out, native("w8a8", raw=True).linear(*args))
+
+
+@pytest.mark.parametrize("sme", [False, True])
+def test_arm_w8_small_tile_team_and_partial_column(native, raw, sme):
+    torch.manual_seed(9714)
+    previous_threads = torch.get_num_threads()
+    try:
+        torch.set_num_threads(8)
+        rows, n, k = 7, 530, 96
+        x = torch.randn(rows, k)
+        w = torch.randint(-127, 128, (n, k), dtype=torch.int8)
+        scales = torch.rand(n) * 0.02 + 0.001
+        ops = native("w8a8")
+        try:
+            packed = ops.pack(w, scales, sme)
+        except RuntimeError as error:
+            if sme and "ISA is unavailable" in str(error):
+                pytest.skip("SME2 unavailable")
+            raise
+        q, sx = _a8(x)
+        expected = (q @ w.float().t()) * sx[:, None] * scales[None]
+        args = [x, packed, n, sme, 32, 128]
+        value = ops.linear(*args)
+        torch.testing.assert_close(value, expected, rtol=2e-4, atol=2e-5)
+        assert torch.equal(value, native("w8a8", raw=True).linear(*args))
+        assert torch.get_num_threads() == 8
+    finally:
+        torch.set_num_threads(previous_threads)
+
+
 @pytest.mark.parametrize("rows", [0, 1, 7, 16])
 @pytest.mark.parametrize("silu", [False, True])
 def test_arm_conv_prefill_state_and_empty_ranges(native, monkeypatch, rows, silu):
@@ -403,6 +520,77 @@ def test_arm_conv_update_triton_state_and_tail(
     assert torch.equal(x, untouched)
     assert torch.equal(state[0], original[0, :, 1::2])
     assert torch.equal(state[-1], original[-1, :, 1::2])
+
+
+@pytest.mark.parametrize("logits_mode", ["ties", "skewed"])
+@pytest.mark.parametrize("rows,experts", [(1, 8), (7, 8), (32, 8), (128, 64)])
+@pytest.mark.parametrize("renormalize", [False, True])
+def test_arm_moe_router_ties_and_fusion(
+    native, raw, monkeypatch, rows, experts, renormalize, logits_mode
+):
+    torch.manual_seed(911 + rows)
+    h, inter, top = 128, 64, 3
+
+    def pack(n, k):
+        w = torch.randint(-8, 8, (n, k), dtype=torch.int8) + 8
+        codes = (w[:, ::2] | (w[:, 1::2] << 4)).byte()
+        scale = (0.001 + torch.rand(n, k // 32) * 0.01).bfloat16()
+        return torch.ops.aten._dyn_quant_pack_4bit_weight(codes, scale, None, 32, k, n)
+
+    w1 = torch.stack([pack(2 * inter, h) for _ in range(experts)])
+    w2 = torch.stack([pack(h, inter) for _ in range(experts)])
+    x = torch.randn(rows, h, dtype=torch.bfloat16)
+    logits = torch.zeros(rows, experts, dtype=torch.bfloat16)
+    if logits_mode == "skewed":
+        # Each token selects different experts with unequal gate weights.
+        logits = (
+            torch.stack(
+                [torch.arange(experts).roll(token % experts) for token in range(rows)]
+            ).bfloat16()
+            * 0.5
+        )
+    values, indices = logits.topk(top, sorted=False)
+    gates = (
+        values.softmax(-1)
+        if renormalize
+        else (values - logits.logsumexp(-1, keepdim=True)).exp()
+    ).float()
+    expected = torch.zeros(rows, h)
+    for token in range(rows):
+        for route in indices[token].argsort():
+            expert = indices[token, route]
+            gu = torch.ops.aten._dyn_quant_matmul_4bit(
+                x[token : token + 1].float(), w1[expert], 32, h, inter * 2
+            )
+            act = torch.nn.functional.silu(gu[:, :inter]) * gu[:, inter:]
+            value = torch.ops.aten._dyn_quant_matmul_4bit(act, w2[expert], 32, inter, h)
+            expected[token] += value[0] * gates[token, route]
+    args = [x, logits, w1, w2, h, inter, top, renormalize]
+    ops = native("moe")
+    out = ops.moe_fused(*args)
+    torch.testing.assert_close(out, expected.bfloat16(), rtol=0.02, atol=0.001)
+    assert torch.equal(out, native("moe", raw=True).moe_fused(*args))
+    torch.testing.assert_close(out, ops.moe(*args), rtol=0.02, atol=0.001)
+
+    for name in (
+        "moe_prefill_routed",
+        "moe_prefill_fused",
+        "moe_prefill_adaptive",
+        "moe_prefill_balanced",
+    ):
+        value = getattr(native("w4a8_g32"), name)(*args)
+        torch.testing.assert_close(value, expected.bfloat16(), rtol=0.02, atol=0.001)
+        assert torch.equal(value, getattr(native("w4a8_g32", raw=True), name)(*args))
+    if rows == 1:
+        monkeypatch.setenv("FLAGGEMS_ARM_MOE_DECODE_THREADS", "2")
+        for name in ("moe_decode_routed", "moe_decode_fused"):
+            value = getattr(native("w4a8_g32"), name)(*args)
+            torch.testing.assert_close(
+                value, expected.bfloat16(), rtol=0.02, atol=0.001
+            )
+            assert torch.equal(
+                value, getattr(native("w4a8_g32", raw=True), name)(*args)
+            )
 
 
 def test_arm_raw_errors_do_not_poison_entry(native, raw):
