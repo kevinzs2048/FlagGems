@@ -20,6 +20,22 @@ def _linear(input, packed, n, *options):
     return input.new_empty((input.shape[0], n), dtype=torch.float32)
 
 
+def _same_input(input, *args, **kwargs):
+    return torch.empty_like(input)
+
+
+def _value_decode(A_log, a, b, dt_bias, query, key, value, *args):
+    return torch.empty_like(value)
+
+
+def _value_prefill(query, key, value, *args):
+    return torch.empty_like(value)
+
+
+def _mutating(*args, **kwargs):
+    return None
+
+
 def _silu_pack(gate_up, mr):
     torch._check(gate_up.ndim == 2)
     torch._check(mr == 1 or mr == 4)
@@ -36,6 +52,17 @@ def register_arm_fake_kernels():
     """Register schemas present in the currently loaded optional library."""
     groups = {
         "flag_gems_arm_w8a8": {"linear": _linear},
+        "flag_gems_arm_gdn": {
+            "gemma_rmsnorm": _same_input,
+            "gemma_fused_add_rmsnorm": _mutating,
+            "gdn_decode": _value_decode,
+            "gdn_prefill": _value_prefill,
+            "gdn_conv1d_update": _same_input,
+            "gdn_conv1d_prefill": _same_input,
+            "gdn_rmsnorm_gated": _same_input,
+            "gdn_packed_decode": _mutating,
+            "gdn_packed_decode_norm": _mutating,
+        },
         "flag_gems_arm_silu_native": {"pack": _silu_pack, "pack_raw": _silu_pack},
     }
     with _lock:

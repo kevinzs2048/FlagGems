@@ -47,7 +47,7 @@ def raw(native):
         if os.environ.get("FLAGGEMS_ARM_REQUIRE_NATIVE_TESTS") == "1":
             pytest.fail("Strict Arm test job requires the scalar CPU Raw compiler")
         pytest.skip("requires CPU scalar native-call support with void results")
-    native("w8a8", raw=True)
+    native("gdn", raw=True)
     return native
 
 
@@ -98,6 +98,93 @@ def test_arm_standalone_w8_quantization(native, raw, monkeypatch, rows, n, k, i8
     )
 
 
+@pytest.mark.parametrize("backend", ["native", "raw"])
+def test_arm_gdn_inference_abi(native, raw, monkeypatch, backend):
+    from flag_gems.runtime.backend._arm.gdn import inference
+
+    torch.manual_seed(417)
+    monkeypatch.setenv("FLAGGEMS_ARM_GDN_BACKEND", backend)
+    q = torch.randn(1, 3, 2, 32, dtype=torch.bfloat16) * 0.1
+    k = torch.randn_like(q) * 0.1
+    v = torch.randn(1, 3, 4, 16, dtype=torch.bfloat16) * 0.1
+    g = -torch.rand(1, 3, 4)
+    beta = torch.rand(1, 3, 4)
+    initial = torch.randn(2, 4, 16, 32) * 0.01
+    starts = torch.tensor([0, 1, 3], dtype=torch.int32)
+    monkeypatch.setenv("FLAGGEMS_GDN_NATIVE_PREFILL", "0")
+    expected, expected_state = inference.torch_chunk_gated_delta_rule(
+        q, k, v, g, beta, initial.clone(), True, cu_seqlens=starts
+    )
+    operation = inference._native_ops().gdn_prefill
+    calls = []
+
+    def observed_prefill(*args):
+        calls.append(True)
+        return operation(*args)
+
+    monkeypatch.setattr(
+        inference, "_native_ops", lambda: SimpleNamespace(gdn_prefill=observed_prefill)
+    )
+    monkeypatch.setenv("FLAGGEMS_GDN_NATIVE_PREFILL", "1")
+    state = initial.clone()
+    output, final = inference.torch_chunk_gated_delta_rule(
+        q, k, v, g, beta, state, True, cu_seqlens=starts
+    )
+    assert len(calls) == 1, "Enabled case must execute the real native/Raw operator"
+    torch.testing.assert_close(output, expected, rtol=0.01, atol=0.001)
+    torch.testing.assert_close(final, expected_state, rtol=2e-5, atol=2e-6)
+    assert final.data_ptr() == state.data_ptr()
+
+
+def test_arm_gdn_inference_initial_state_optional(monkeypatch):
+    from flag_gems.runtime.backend._arm.gdn import inference
+
+    monkeypatch.setenv("FLAGGEMS_GDN_NATIVE_PREFILL", "0")
+    q = torch.zeros(1, 2, 1, 32, dtype=torch.bfloat16)
+    v = torch.ones(1, 2, 1, 16, dtype=torch.bfloat16)
+    output, state = inference.torch_chunk_gated_delta_rule(
+        q, q, v, torch.zeros(1, 2, 1), torch.ones(1, 2, 1), None, True
+    )
+    assert torch.count_nonzero(output) == 0
+    assert state.dtype == torch.float32 and state.shape == (1, 1, 16, 32)
+
+
+def test_arm_gdn_noninplace_decode_preserves_input_state(native, monkeypatch):
+    from flag_gems.runtime.backend._arm.gdn import inference
+
+    torch.manual_seed(173)
+    q = torch.randn(1, 1, 2, 32, dtype=torch.bfloat16) * 0.1
+    k = torch.randn_like(q)
+    v = torch.randn(1, 1, 4, 16, dtype=torch.bfloat16)
+    initial = torch.randn(2, 4, 16, 32) * 0.01
+    args = (
+        torch.zeros(4),
+        torch.randn(1, 4),
+        torch.randn(1, 4),
+        torch.zeros(4),
+        q,
+        k,
+        v,
+    )
+    indices = torch.tensor([1], dtype=torch.int32)
+    monkeypatch.setenv("FLAGGEMS_GDN_NATIVE_DECODE", "0")
+    expected, expected_state = inference.torch_fused_sigmoid_gating_delta_rule_update(
+        *args,
+        initial_state=initial.clone(),
+        inplace_final_state=False,
+        ssm_state_indices=indices,
+    )
+    monkeypatch.setenv("FLAGGEMS_GDN_NATIVE_DECODE", "1")
+    state = initial.clone()
+    actual, final = inference.torch_fused_sigmoid_gating_delta_rule_update(
+        *args, initial_state=state, inplace_final_state=False, ssm_state_indices=indices
+    )
+    assert torch.equal(state, initial)
+    assert final.data_ptr() != state.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(final, expected_state, rtol=0, atol=0)
+
+
 def test_arm_online_w8_chunk_packing(native):
     from flag_gems.runtime.backend._arm.fused.w8a8_prepare import prepare_w8a8_weight
 
@@ -112,6 +199,210 @@ def test_arm_online_w8_chunk_packing(native):
         assert torch.equal(prepare_w8a8_weight(weight, chunk_rows=rows), expected)
     with pytest.raises(ValueError, match="finite"):
         prepare_w8a8_weight(torch.full_like(weight, float("nan")))
+
+
+@pytest.mark.parametrize("hidden", [128, 1024, 2048])
+@pytest.mark.parametrize("rows", [0, 1, 16, 512])
+@pytest.mark.parametrize("fused", [False, True])
+def test_prepared_gemma_matches_native(native, hidden, rows, fused):
+    from flag_gems.runtime.backend._arm.fused.gemma_norm import prepare_gemma_triton
+
+    ops = prepare_gemma_triton()
+    assert prepare_gemma_triton() is ops
+    # Offset views must not inherit alignment assumptions from warmup tensors.
+    x = torch.randn(rows * hidden + 1, dtype=torch.bfloat16)[1:].view(rows, hidden)
+    weight = torch.randn(hidden + 1, dtype=torch.bfloat16)[1:]
+    residual = torch.randn_like(x)
+    if fused:
+        expected, expected_state = x.clone(), residual.clone()
+        ops.gemma_fused_add_rmsnorm(expected, expected_state, weight, 1e-6)
+        actual = torch.empty(x.numel() + 1, dtype=x.dtype)[1:].view_as(x)
+        state = torch.empty(x.numel() + 1, dtype=x.dtype)[1:].view_as(x)
+        actual.copy_(x)
+        state.copy_(residual)
+        ops.gemma_fused_add_rmsnorm.triton(actual, state, weight, 1e-6)
+        assert torch.equal(actual, expected) and torch.equal(state, expected_state)
+    else:
+        expected = ops.gemma_rmsnorm(x, weight, 1e-6)
+        assert torch.equal(ops.gemma_rmsnorm.triton(x, weight, 1e-6), expected)
+
+
+def test_prepared_gemma_rejects_unsupported_contracts(native):
+    from flag_gems.runtime.backend._arm.fused.gemma_norm import prepare_gemma_triton
+
+    ops = prepare_gemma_triton()
+    x = torch.zeros(1, 128, dtype=torch.bfloat16)
+    w = torch.zeros(128, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="epsilon"):
+        ops.gemma_rmsnorm.triton(x, w, 1e-5)
+    with pytest.raises(RuntimeError, match="BF16"):
+        ops.gemma_rmsnorm.triton(x.float(), w, 1e-6)
+
+
+@pytest.mark.parametrize("rows", [1, 16, 512])
+@pytest.mark.parametrize("hidden", [13, 128, 1024, 2048])
+@pytest.mark.parametrize("fused", [False, True])
+def test_arm_gemma_norm_forward_and_raw(native, raw, rows, hidden, fused):
+    torch.manual_seed(282 + rows + hidden)
+    x = torch.randn(rows, hidden, dtype=torch.bfloat16)
+    residual = torch.randn_like(x)
+    weight = torch.randn(hidden, dtype=torch.bfloat16) * 0.1
+    source = (x + residual).float() if fused else x.float()
+    expected = (
+        source
+        * torch.rsqrt(source.square().mean(-1, keepdim=True) + 1e-6)
+        * (weight.float() + 1.0)
+    )
+    ops, r = native("gdn"), native("gdn", raw=True)
+    if fused:
+        actual = x.clone()
+        state = residual.clone()
+        ops.gemma_fused_add_rmsnorm(actual, state, weight, 1e-6)
+        other = x.clone()
+        other_state = residual.clone()
+        r.gemma_fused_add_rmsnorm(other, other_state, weight, 1e-6)
+        assert torch.equal(state, x + residual)
+        assert torch.equal(state, other_state)
+    else:
+        actual = ops.gemma_rmsnorm(x, weight, 1e-6)
+        other = r.gemma_rmsnorm(x, weight, 1e-6)
+    assert torch.equal(actual, other)
+    torch.testing.assert_close(actual.float(), expected, rtol=0.01, atol=0.01)
+
+
+@pytest.mark.parametrize("rows", [0, 1, 7, 16])
+@pytest.mark.parametrize("silu", [False, True])
+def test_arm_conv_prefill_state_and_empty_ranges(native, monkeypatch, rows, silu):
+    from flag_gems.runtime.backend._arm.gdn import gdn_conv1d_prefill_triton
+
+    torch.manual_seed(29 + rows)
+    dim = 127
+    x = torch.randn(rows, dim, dtype=torch.bfloat16).t()
+    initial = torch.randn(3, dim, 5, dtype=torch.bfloat16)
+    state = initial.clone()
+    weight = torch.randn(dim, 4, dtype=torch.bfloat16)
+    bias = torch.randn(dim, dtype=torch.bfloat16)
+    starts = torch.tensor([99, 0, 0, rows], dtype=torch.int32)[1:]
+    slots = torch.tensor([99, 2, 0], dtype=torch.int32)[1:]
+    flags = torch.tensor([False, False, True])[1:]
+    expected_state = initial.clone()
+    expected_state[2, :, :3].zero_()
+    history = initial[0, :, :3].float()
+    expected = torch.empty_like(x)
+    for token in range(rows):
+        value = x[:, token].float()
+        result = bias.float() + history[:, 0] * weight[:, 0].float()
+        result = result + history[:, 1] * weight[:, 1].float()
+        result = result + history[:, 2] * weight[:, 2].float()
+        result = result + value * weight[:, 3].float()
+        expected[:, token] = torch.nn.functional.silu(result) if silu else result
+        history = torch.cat([history[:, 1:], value[:, None]], -1)
+    expected_state[0, :, :3] = history
+    out = gdn_conv1d_prefill_triton(x, state, weight, bias, starts, slots, flags, silu)
+    torch.testing.assert_close(out, expected, rtol=0.01, atol=0.016)
+    assert torch.equal(state, expected_state)
+    # Unselected slots and speculative rollback history must remain unchanged.
+    assert torch.equal(state[1], initial[1])
+    assert torch.equal(state[:, :, 3:], initial[:, :, 3:])
+    if silu:
+        from flag_gems.runtime.backend._arm.gdn.inference import torch_causal_conv1d_fn
+
+        for use_triton in ("0", "1"):
+            monkeypatch.setenv("FLAGGEMS_GDN_CONV_PREFILL_TRITON", use_triton)
+            bridge_state = initial.clone()
+            bridged = torch_causal_conv1d_fn(
+                x,
+                weight,
+                bias,
+                bridge_state,
+                starts,
+                slots,
+                flags,
+            )
+            torch.testing.assert_close(bridged, expected, rtol=0.01, atol=0.016)
+            assert torch.equal(bridge_state, expected_state)
+
+
+@pytest.mark.parametrize("backend", ["native", "raw", "triton"])
+@pytest.mark.parametrize("invalid", ["empty", "strided", "coverage", "dtype", "rank"])
+def test_arm_conv_prefill_rejects_invalid_metadata(native, raw, invalid, backend):
+    x = torch.zeros(8, 1, dtype=torch.bfloat16)
+    state = torch.zeros(1, 8, 3, dtype=torch.bfloat16)
+    weight = torch.zeros(8, 4, dtype=torch.bfloat16)
+    starts = torch.tensor([0, 1], dtype=torch.int32)
+    if invalid == "empty":
+        starts = starts[:1]
+    elif invalid == "strided":
+        starts = torch.tensor([0, 99, 1, 99], dtype=torch.int32)[::2]
+    elif invalid == "coverage":
+        starts = torch.tensor([0, 0], dtype=torch.int32)
+    elif invalid == "dtype":
+        starts = starts.float()
+    else:
+        starts = starts.unsqueeze(0)
+    if backend == "triton":
+        from flag_gems.runtime.backend._arm.gdn import gdn_conv1d_prefill_triton
+
+        operation = gdn_conv1d_prefill_triton
+    else:
+        operation = native("gdn", raw=backend == "raw").gdn_conv1d_prefill
+    with pytest.raises(RuntimeError, match="GDN conv prefill"):
+        operation(
+            x,
+            state,
+            weight,
+            None,
+            starts,
+            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([False]),
+            True,
+        )
+
+
+@pytest.mark.parametrize("rows", [0, 1, 3, 16])
+@pytest.mark.parametrize("silu", [False, True])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("backend", ["native", "raw", "triton"])
+def test_arm_conv_update_triton_state_and_tail(
+    native, raw, rows, silu, has_bias, backend
+):
+    from flag_gems.runtime.backend._arm.gdn import gdn_conv1d_update_triton
+
+    torch.manual_seed(721 + rows)
+    dim = 127
+    # Offset views exercise unaligned pointers as well as positive strides.
+    x = torch.randn(rows, dim * 2 + 1, dtype=torch.bfloat16)[:, 1::2]
+    original = torch.randn(rows + 2, dim, 6, dtype=torch.bfloat16)
+    state = original.clone()[:, :, 1::2]
+    weight = torch.randn(dim, 8, dtype=torch.bfloat16)[:, 1::2]
+    bias = torch.randn(dim * 2 + 1, dtype=torch.bfloat16)[1::2] if has_bias else None
+    slots = torch.full((rows * 2 + 1,), 99, dtype=torch.int32)[1::2]
+    slots.copy_(torch.arange(rows, 0, -1, dtype=torch.int32))
+    expected_state = original[:, :, 1::2].clone()
+    expected = torch.empty_like(x)
+    for token, slot in enumerate(slots):
+        history = expected_state[slot].float()
+        result = history[:, 0] * weight[:, 0].float()
+        if bias is not None:
+            result = bias.float() + result
+        result = result + history[:, 1] * weight[:, 1].float()
+        result = result + history[:, 2] * weight[:, 2].float()
+        result = result + x[token].float() * weight[:, 3].float()
+        expected[token] = torch.nn.functional.silu(result) if silu else result
+        expected_state[slot, :, :2] = expected_state[slot, :, 1:].clone()
+        expected_state[slot, :, 2] = x[token]
+    untouched = x.clone()
+    operation = (
+        gdn_conv1d_update_triton
+        if backend == "triton"
+        else native("gdn", raw=backend == "raw").gdn_conv1d_update
+    )
+    out = operation(x, state, weight, bias, slots, silu)
+    torch.testing.assert_close(out, expected, rtol=0.01, atol=0.016)
+    assert torch.equal(state, expected_state)
+    assert torch.equal(x, untouched)
+    assert torch.equal(state[0], original[0, :, 1::2])
+    assert torch.equal(state[-1], original[-1, :, 1::2])
 
 
 def test_arm_raw_errors_do_not_poison_entry(native, raw):
@@ -291,6 +582,199 @@ def test_arm_silu_raw_concurrent_initialization(native, raw, monkeypatch):
     )
 
 
+def _gdn_step(q, k, v, state, decay, beta, normalize):
+    q, k, v = q.float(), k.float(), v.float()
+    if normalize:
+        q = q / (q.square().sum(-1, keepdim=True) + 1e-6).sqrt()
+        k = k / (k.square().sum(-1, keepdim=True) + 1e-6).sqrt()
+    q = q / q.shape[-1] ** 0.5
+    q = q.repeat_interleave(v.shape[0] // q.shape[0], 0)
+    k = k.repeat_interleave(v.shape[0] // k.shape[0], 0)
+    decayed = state * decay[:, None, None]
+    predicted = (decayed * k[:, None, :]).sum(-1)
+    delta = (v - predicted) * beta[:, None]
+    updated = decayed + k[:, None, :] * delta[:, :, None]
+    return (updated * q[:, None, :]).sum(-1).bfloat16(), updated
+
+
+@pytest.mark.parametrize("normalize", [False, True])
+@pytest.mark.parametrize("layout", ["contiguous", "gates", "parameters", "metadata"])
+def test_arm_gdn_recurrence_and_prefill(native, raw, normalize, layout):
+    torch.manual_seed(470)
+    tokens, kh, vh, kd, vd = 3, 2, 4, 32, 16
+    q = torch.randn(1, tokens, kh, kd, dtype=torch.bfloat16) * 0.1
+    k = torch.randn_like(q) * 0.1
+    v = torch.randn(1, tokens, vh, vd, dtype=torch.bfloat16) * 0.1
+    original = torch.randn(3, vh, vd, kd) * 0.01
+    al = torch.randn(vh) * 0.1
+    a = torch.randn(tokens, vh, dtype=torch.bfloat16)
+    b = torch.randn_like(a)
+    dt = torch.randn(vh, dtype=torch.bfloat16) * 0.1
+    g = -al.exp() * torch.nn.functional.softplus(a.float() + dt.float())
+    beta = b.float().sigmoid()
+    # Decode visits independent slots; prefill visits two sequences, with an
+    # empty final sequence. Their references exercise different state ownership.
+    indices = torch.tensor([2, 0, 1], dtype=torch.int32)
+
+    def strided_copy(tensor):
+        storage = torch.full(
+            (*tensor.shape[:-1], tensor.shape[-1] * 2 + 1),
+            99,
+            dtype=tensor.dtype,
+        )
+        view = storage[..., 1::2]
+        view.copy_(tensor)
+        return view
+
+    if layout == "gates":
+        a, b = strided_copy(a), strided_copy(b)
+    elif layout == "parameters":
+        al, dt = strided_copy(al), strided_copy(dt)
+    elif layout == "metadata":
+        indices = strided_copy(indices)
+    expected_state = original.clone()
+    expected = torch.empty_like(v)
+    for token, slot in enumerate(indices):
+        expected[0, token], expected_state[slot] = _gdn_step(
+            q[0, token],
+            k[0, token],
+            v[0, token],
+            expected_state[slot],
+            g[token].exp(),
+            beta[token],
+            normalize,
+        )
+    state = original.clone()
+    args = [al, a, b, dt, q, k, v, state, indices, normalize]
+    out = native("gdn").gdn_decode(*args)
+    torch.testing.assert_close(out, expected, rtol=0.01, atol=0.001)
+    torch.testing.assert_close(state, expected_state, rtol=2e-5, atol=2e-6)
+    state.copy_(original)
+    assert torch.equal(out, native("gdn", raw=True).gdn_decode(*args))
+    torch.testing.assert_close(state, expected_state, rtol=2e-5, atol=2e-6)
+
+    starts = torch.tensor([0, 1, tokens, tokens], dtype=torch.int32)
+    if layout == "metadata":
+        starts = strided_copy(starts)
+    expected_state = original.clone()
+    for slot in range(3):
+        for token in range(starts[slot], starts[slot + 1]):
+            expected[0, token], expected_state[slot] = _gdn_step(
+                q[0, token],
+                k[0, token],
+                v[0, token],
+                expected_state[slot],
+                g[token].exp(),
+                beta[token],
+                normalize,
+            )
+    state.copy_(original)
+    args = [q, k, v, g.unsqueeze(0), beta.unsqueeze(0), state, starts, normalize]
+    out = native("gdn").gdn_prefill(*args)
+    torch.testing.assert_close(out, expected, rtol=0.01, atol=0.001)
+    torch.testing.assert_close(state, expected_state, rtol=2e-5, atol=2e-6)
+    state.copy_(original)
+    assert torch.equal(out, native("gdn", raw=True).gdn_prefill(*args))
+    assert torch.equal(state[2], original[2])
+
+
+@pytest.mark.parametrize("sigmoid", [False, True])
+def test_arm_gdn_gated_norm_tail(native, raw, sigmoid):
+    torch.manual_seed(441)
+    x = torch.randn(7, 19, dtype=torch.bfloat16)
+    gate = torch.randn_like(x)
+    weight = torch.randn(19, dtype=torch.bfloat16)
+    act = gate.float().sigmoid()
+    if not sigmoid:
+        act = gate.float() * act
+    expected = (
+        x.float()
+        * (x.float().square().mean(-1, keepdim=True) + 1e-6).rsqrt()
+        * weight.float()
+        * act
+    ).bfloat16()
+    args = [x, weight, gate, 1e-6, sigmoid]
+    out = native("gdn").gdn_rmsnorm_gated(*args)
+    torch.testing.assert_close(out, expected, rtol=0.01, atol=0.001)
+    assert torch.equal(out, native("gdn", raw=True).gdn_rmsnorm_gated(*args))
+
+
+@pytest.mark.parametrize("gate", [None, "silu", "sigmoid"])
+@pytest.mark.parametrize("persistent", [False, True])
+def test_arm_gdn_packed_output_and_state(native, raw, monkeypatch, gate, persistent):
+    monkeypatch.setenv("FLAGGEMS_GDN_NATIVE_PERSISTENT_DECODE", str(int(persistent)))
+    torch.manual_seed(816)
+    kh, vh, kd, vd = 2, 4, 32, 16
+    dim = kh * kd * 2 + vh * vd
+    x = torch.randn(1, dim, dtype=torch.bfloat16) * 0.1
+    untouched = x.clone()
+    cs0 = torch.randn(2, dim, 3, dtype=torch.bfloat16) * 0.1
+    rs0 = torch.randn(2, vh, vd, kd) * 0.01
+    cw = torch.randn(dim, 4, dtype=torch.bfloat16) * 0.1
+    cb = torch.randn(dim, dtype=torch.bfloat16) * 0.1
+    a = torch.randn(1, vh, dtype=torch.bfloat16)
+    b = torch.randn_like(a)
+    al, dt = torch.zeros(vh), torch.zeros(vh, dtype=torch.bfloat16)
+    index = torch.tensor([1], dtype=torch.int32)
+    cs, rs = cs0.clone(), rs0.clone()
+    # Independent Torch equations: do not build the oracle from the same
+    # native conv/recurrence/norm components that the fused path calls.
+    history = cs[1].float()
+    conv = cb.float() + history[:, 0] * cw[:, 0].float()
+    conv = conv + history[:, 1] * cw[:, 1].float()
+    conv = conv + history[:, 2] * cw[:, 2].float()
+    conv = conv + x[0].float() * cw[:, 3].float()
+    mixed = torch.nn.functional.silu(conv).bfloat16().unsqueeze(0)
+    cs[1, :, :2] = cs0[1, :, 1:]
+    cs[1, :, 2] = x[0]
+    q, k, v = mixed.split([kh * kd, kh * kd, vh * vd], -1)
+    expected, next_state = _gdn_step(
+        q.view(kh, kd),
+        k.view(kh, kd),
+        v.view(vh, vd),
+        rs[1],
+        (-al.exp() * torch.nn.functional.softplus(a[0].float() + dt.float())).exp(),
+        b[0].float().sigmoid(),
+        True,
+    )
+    expected = expected.view(1, vh, vd)
+    rs[1] = next_state
+    z = torch.randn_like(expected)
+    weight = torch.randn(vd, dtype=torch.bfloat16)
+    if gate is not None:
+        activation = z.float().sigmoid()
+        if gate == "silu":
+            activation = z.float() * activation
+        values = expected.float()
+        expected = (
+            values
+            * (values.square().mean(-1, keepdim=True) + 1e-6).rsqrt()
+            * weight.float()
+            * activation
+        ).bfloat16()
+    expected_cs, expected_rs = cs.clone(), rs.clone()
+    output = (
+        torch.empty(1, vh, vd * 2, dtype=torch.bfloat16)[:, :, ::2]
+        if gate is None and persistent
+        else torch.empty_like(expected)
+    )
+    for is_raw in (False, True):
+        cs.copy_(cs0)
+        rs.copy_(rs0)
+        args = [x, a, b, al, dt, cs, cw, cb, rs, index]
+        if gate is None:
+            native("gdn", raw=is_raw).gdn_packed_decode(*args, output, True)
+        else:
+            native("gdn", raw=is_raw).gdn_packed_decode_norm(
+                *args, z, weight, 1e-6, gate == "sigmoid", output, True
+            )
+        torch.testing.assert_close(output, expected, rtol=0.01, atol=0.001)
+        assert torch.equal(cs, expected_cs)
+        torch.testing.assert_close(rs, expected_rs, rtol=2e-5, atol=2e-6)
+        assert torch.equal(x, untouched)
+        assert torch.equal(rs[0], rs0[0])
+
+
 @pytest.mark.parametrize(
     "rows,mr", [(0, 1), (1, 1), (1, 4), (2, 4), (3, 4), (7, 4), (16, 4)]
 )
@@ -365,6 +849,24 @@ def test_arm_silu_a8_rounding_and_row_stride(native, raw, rows, mr):
     assert torch.all(padded_codes == 127)
     assert torch.all(padded_offsets == -127)
     assert torch.all(padded_scales == 1)
+
+
+def test_arm_prepared_entries_do_not_assume_dummy_pointer_alignment(native, raw):
+    from flag_gems.runtime.backend._arm.gdn import conv_prefill
+    from flag_gems.runtime.backend._arm.tle_raw import native_raw, silu_a8_raw
+
+    silu_a8_raw.initialize_silu_a8_raw()
+    conv_prefill.prepare_conv_prefill(native_raw._owners[0], 127)
+    compiled = [native_raw._owners[2]]
+    compiled.extend(entry[1] for entry in native_raw._owners[4])
+    compiled.extend(entry[1] for entry in silu_a8_raw._owners[3])
+    for entry in compiled:
+        assert "triton_cpu.raw_call" in entry.asm["ttcir"]
+    compiled.extend(entry[1] for entry in conv_prefill._kernel_owners.values())
+    for entry in compiled:
+        # C++ launches these entries with real views and stack descriptors;
+        # dummy warmup Tensor alignment is not part of their C ABI contract.
+        assert "tt.divisibility" not in entry.asm["ttir"]
 
 
 def test_arm_silu_boundary_leaf_ownership(native, raw):
@@ -450,3 +952,21 @@ def test_arm_silu_metadata_registration_stays_out_of_compute(native, raw, monkey
     monkeypatch.setattr(meta, "register_arm_fake_kernels", unexpected_registration)
     assert torch.equal(silu_mul_a8_pack_native(x), expected)
     assert torch.equal(silu_a8_raw.silu_mul_a8_pack_raw(x), expected)
+
+
+def test_arm_gdn_fake_mutation_schema(native):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    native("gdn")
+    with FakeTensorMode():
+        x = torch.empty((3, 128), dtype=torch.bfloat16)
+        weight = torch.empty(128, dtype=torch.bfloat16)
+        result = torch.ops.flag_gems_arm_gdn.gemma_rmsnorm(x, weight, 1e-6)
+        assert result.shape == x.shape and result.dtype == x.dtype
+        residual = torch.empty_like(x)
+        assert (
+            torch.ops.flag_gems_arm_gdn.gemma_fused_add_rmsnorm(
+                x, residual, weight, 1e-6
+            )
+            is None
+        )

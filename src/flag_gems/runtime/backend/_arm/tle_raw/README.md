@@ -25,3 +25,8 @@ Use arm_native_ops("w8a8", raw=True). Dynamic asymmetric per-token A8 and FP32
 channel scales use the package-owned N4 format. Do not mix packed ABIs.
 Torch supplies the matched OpenMP runtime; Apple Clang may require explicit
 OpenMP compile/include flags and its runtime path. See the CMake cache options.
+
+The standalone target also builds FP32 GDN recurrence and BF16 convolution/norm.
+Gate and state-index strides are respected; token ranges must cover the input.
+Prepared ordinary Triton convolution and Gemma kernels retain their matched
+host ABI. Reference/fallback paths do not certify all framework graph modes.
