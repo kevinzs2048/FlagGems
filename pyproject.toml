@@ -312,6 +312,9 @@ flaggems-flagtune-compare = "flag_gems.flagtune.offline.cli.compare:main"
 "flag_gems" = ["backends.yaml"]
 "flag_gems.runtime" = ["*/**/*.yaml"]
 "flag_gems.runtime.backend._metax" = ["stft_fft_shim.cpp"]
+"flag_gems.runtime.backend._arm.tle_raw" = [
+    "README.md", "csrc/*.cpp", "csrc/*.h", "csrc/*.txt",
+]
 "flag_gems.flagtune.inference" = ["manifest.json"]
 "flag_gems.flagtune.offline.contracts" = ["configs/*.yaml"]
 

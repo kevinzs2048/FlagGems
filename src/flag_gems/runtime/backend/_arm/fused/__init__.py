@@ -12,11 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from ..tle_raw.silu_mul_a8_pack_native import silu_mul_a8_pack_native  # noqa: F401
 from .fused_add_rms_norm import fused_add_rms_norm  # noqa: F401
 from .patch_qwen3_mlp import patch_qwen3_mlp, unpatch_qwen3_mlp  # noqa: F401
 
 __all__ = [
     "fused_add_rms_norm",
     "patch_qwen3_mlp",
+    "silu_mul_a8_pack_native",
     "unpatch_qwen3_mlp",
 ]
+
+# Keep existing backends importable before the optional CPU TLE leaf is built.
+try:
+    from ..tle_raw.silu_a8_raw import silu_mul_a8_pack_raw  # noqa: F401
+except ImportError:
+    pass
+else:
+    __all__ = sorted([*__all__, "silu_mul_a8_pack_raw"])
