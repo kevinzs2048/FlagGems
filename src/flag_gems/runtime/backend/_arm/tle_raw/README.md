@@ -58,8 +58,10 @@ BF16 vector input domain and preserves ATen scalar-tail chunk boundaries;
 `reference_threads` fixes that logical reference schedule independently of the
 actual worker count. Both execute through cached CPU Triton `raw_call` entries.
 This does not register a replacement for every ATen call or automatically enable
-BGE model adaptation. The initial integration is numerically validated on M5;
-Linux execution and performance require separate validation.
+BGE model adaptation. Numerical tests pass on M5 with Apple Clang and on CIX P1
+with GCC 14/Torch 2.11. The target uses GCC `fast` and Clang `on` contraction to
+match those ATen reference builds; verify this contract when changing Torch or
+compiler. Linux model-level performance requires separate validation.
 
 The existing `tests/test_arm_native.py` includes the complete GELU input domain,
 residual rounding, empty/tail shapes and invalid-input checks. With the DSO

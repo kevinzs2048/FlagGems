@@ -169,8 +169,15 @@ if(FLAGGEMS_BUILD_ARM_KAI OR FLAGGEMS_BUILD_ARM_STANDALONE OR FLAGGEMS_BUILD_ARM
   if(FLAGGEMS_BUILD_ARM_ELEMENTWISE)
     add_library(flag_gems_arm_elementwise SHARED elementwise.cpp)
     target_link_libraries(flag_gems_arm_elementwise PRIVATE Torch::Torch "${_torch_omp}")
-    # Preserve ATen's vector/moments contraction and BF16 rounding schedule.
-    target_compile_options(flag_gems_arm_elementwise PRIVATE ${_omp_compile_flags} -O3 -ffp-contract=on)
+    # Match the reference ATen moments expressions: GCC uses its default fast
+    # contraction while Clang preserves contraction within expressions. Using
+    # Clang's setting with GCC changes rare BF16 residual LayerNorm results.
+    target_compile_options(flag_gems_arm_elementwise PRIVATE ${_omp_compile_flags} -O3
+      "$<$<CXX_COMPILER_ID:GNU>:-ffp-contract=fast>"
+      "$<$<CXX_COMPILER_ID:Clang,AppleClang>:-ffp-contract=on>")
+    if(UNIX AND NOT APPLE)
+      target_link_options(flag_gems_arm_elementwise PRIVATE "LINKER:-Bsymbolic-functions")
+    endif()
     if(FLAGGEMS_INSTALL)
       install(TARGETS flag_gems_arm_elementwise
         LIBRARY DESTINATION flag_gems/runtime/backend/_arm/tle_raw/lib)
