@@ -28,6 +28,43 @@ does not remove compilation or the optional KAI dependency.
 
 ## Build
 
+### BF16 residual LayerNorm and exact GELU
+
+`FLAGGEMS_BUILD_ARM_ELEMENTWISE=ON` adds the optional
+`flag_gems_arm_elementwise` target without enabling W4/W8 GEMM or KleidiAI.
+It uses Torch's OpenMP runtime and ATen vector/moments helpers. Build it with
+the inference Python/Torch and matching OpenMP headers:
+
+```sh
+cmake -S src/flag_gems/runtime/backend/_arm/tle_raw/csrc -B build/arm-elementwise \
+  -DPython_EXECUTABLE=/path/to/python \
+  -DFLAGGEMS_BUILD_ARM_ELEMENTWISE=ON
+cmake --build build/arm-elementwise -j4
+cmake --install build/arm-elementwise --prefix /path/to/site-packages
+```
+
+The default build also produces the existing SiLU library. For a target-only
+developer build, build `--target flag_gems_arm_elementwise` and point
+`FLAGGEMS_ARM_ELEMENTWISE_LIBRARY` at that DSO instead of running the install
+step. The prepared helpers otherwise look under this package's `tle_raw/lib`
+directory. Apple Clang builds require the matching OpenMP compile flags/include
+directory in the usual CMake OpenMP settings.
+
+The opt-in helpers are `PreparedAddLayerNormRaw` and `PreparedGeluErfRaw` in
+`flag_gems.runtime.backend._arm.fused.prepared_elementwise`. They accept
+contiguous CPU BF16 tensors, reject autograd execution and return fresh output.
+Residual sums round to BF16 before moments/normalization. GELU maps the complete
+BF16 vector input domain and preserves ATen scalar-tail chunk boundaries;
+`reference_threads` fixes that logical reference schedule independently of the
+actual worker count. Both execute through cached CPU Triton `raw_call` entries.
+This does not register a replacement for every ATen call or automatically enable
+BGE model adaptation. The initial integration is numerically validated on M5;
+Linux execution and performance require separate validation.
+
+The existing `tests/test_arm_native.py` includes the complete GELU input domain,
+residual rounding, empty/tail shapes and invalid-input checks. With the DSO
+available, select these tests using `-k arm_bf16`; no model weights are needed.
+
 ### Independent W8A8 / GDN build
 
 For the MiniCPM-V-4.7-1B W8A8 CPU path, use

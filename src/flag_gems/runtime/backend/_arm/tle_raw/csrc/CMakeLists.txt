@@ -101,10 +101,11 @@ endif()
 option(FLAGGEMS_BUILD_ARM_KAI "Build Arm quantized GEMM and routed MoE" OFF)
 option(FLAGGEMS_BUILD_ARM_STANDALONE "Build independent W8A8 and GDN without KleidiAI" OFF)
 option(FLAGGEMS_BUILD_ARM_GDN "Include Arm GDN and normalization in the inference library" ON)
+option(FLAGGEMS_BUILD_ARM_ELEMENTWISE "Build BF16 residual LayerNorm and exact GELU CPU Raw leaves" OFF)
 if(FLAGGEMS_BUILD_ARM_KAI AND FLAGGEMS_BUILD_ARM_STANDALONE)
   message(FATAL_ERROR "Choose either ARM_KAI or ARM_STANDALONE")
 endif()
-if(FLAGGEMS_BUILD_ARM_KAI OR FLAGGEMS_BUILD_ARM_STANDALONE)
+if(FLAGGEMS_BUILD_ARM_KAI OR FLAGGEMS_BUILD_ARM_STANDALONE OR FLAGGEMS_BUILD_ARM_ELEMENTWISE)
  if(FLAGGEMS_BUILD_ARM_KAI)
   set(KLEIDIAI_ROOT "" CACHE PATH "KleidiAI 1.29 source/include directory")
   set(KLEIDIAI_LIBRARY "" CACHE FILEPATH "KleidiAI static library")
@@ -127,41 +128,53 @@ if(FLAGGEMS_BUILD_ARM_KAI OR FLAGGEMS_BUILD_ARM_STANDALONE)
     message(FATAL_ERROR "Expected one Torch OpenMP runtime, found: ${_torch_omp}")
   endif()
   separate_arguments(_omp_compile_flags NATIVE_COMMAND "${OpenMP_CXX_FLAGS}")
-  if(FLAGGEMS_BUILD_ARM_STANDALONE)
-    add_library(flag_gems_arm_native SHARED
-      raw_dispatch.cpp w8a8_standalone.cpp silu_mul_a8_pack.cpp)
-    set_source_files_properties(w8a8_standalone.cpp PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
-    set(_arm_external_libraries)
-  else()
-    add_library(flag_gems_arm_native SHARED
-      raw_dispatch.cpp g32.cpp w8a8.cpp moe_prepack.cpp moe_prefill.cpp
-      silu_mul_a8_pack.cpp)
-    target_include_directories(flag_gems_arm_native PRIVATE "${KLEIDIAI_ROOT}")
-    set(_arm_external_libraries "${KLEIDIAI_LIBRARY}")
+  if(FLAGGEMS_BUILD_ARM_KAI OR FLAGGEMS_BUILD_ARM_STANDALONE)
+    if(FLAGGEMS_BUILD_ARM_STANDALONE)
+      add_library(flag_gems_arm_native SHARED
+        raw_dispatch.cpp w8a8_standalone.cpp silu_mul_a8_pack.cpp)
+      set_source_files_properties(w8a8_standalone.cpp PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
+      set(_arm_external_libraries)
+    else()
+      add_library(flag_gems_arm_native SHARED
+        raw_dispatch.cpp g32.cpp w8a8.cpp moe_prepack.cpp moe_prefill.cpp
+        silu_mul_a8_pack.cpp)
+      target_include_directories(flag_gems_arm_native PRIVATE "${KLEIDIAI_ROOT}")
+      set(_arm_external_libraries "${KLEIDIAI_LIBRARY}")
+    endif()
+    if(FLAGGEMS_BUILD_ARM_GDN)
+      target_sources(flag_gems_arm_native PRIVATE gdn.cpp conv_prefill.cpp)
+    endif()
+    target_link_libraries(flag_gems_arm_native PRIVATE
+      Torch::Torch "${_torch_omp}" ${_arm_external_libraries} ${CMAKE_DL_LIBS})
+    target_compile_options(flag_gems_arm_native PRIVATE ${_omp_compile_flags})
+    target_compile_options(flag_gems_arm_native PRIVATE -O3 -ffp-contract=off)
+    # GDN's historical recurrence uses compiler-contractible multiply/add
+    # expressions, including ATen vector operators. Preserve the original
+    # compiler defaults for this source: disabling contraction changes its
+    # FP32 state schedule and removes the native FMA instructions. The SiLU
+    # packing source and other operators retain their explicit off setting.
+    set_source_files_properties(gdn.cpp PROPERTIES COMPILE_OPTIONS
+      "$<$<CXX_COMPILER_ID:GNU>:-ffp-contract=fast>;$<$<CXX_COMPILER_ID:Clang,AppleClang>:-ffp-contract=on>")
+    target_compile_features(flag_gems_arm_native PRIVATE cxx_std_17)
+    # Bind the dense KAI implementation locally. Routed expert operations
+    # explicitly resolve Torch's packed-weight ABI in runtime_kai.h.
+    if(UNIX AND NOT APPLE)
+      target_link_options(flag_gems_arm_native PRIVATE "LINKER:-Bsymbolic-functions")
+    endif()
+    if(FLAGGEMS_INSTALL)
+      install(TARGETS flag_gems_arm_native
+        LIBRARY DESTINATION flag_gems/runtime/backend/_arm/tle_raw/lib)
+    endif()
   endif()
-  if(FLAGGEMS_BUILD_ARM_GDN)
-    target_sources(flag_gems_arm_native PRIVATE gdn.cpp conv_prefill.cpp)
-  endif()
-  target_link_libraries(flag_gems_arm_native PRIVATE
-    Torch::Torch "${_torch_omp}" ${_arm_external_libraries} ${CMAKE_DL_LIBS})
-  target_compile_options(flag_gems_arm_native PRIVATE ${_omp_compile_flags})
-  target_compile_options(flag_gems_arm_native PRIVATE -O3 -ffp-contract=off)
-  # GDN's historical recurrence uses compiler-contractible multiply/add
-  # expressions, including ATen vector operators. Preserve the original
-  # compiler defaults for this source: disabling contraction changes its
-  # FP32 state schedule and removes the native FMA instructions. The SiLU
-  # packing source and other operators retain their explicit off setting.
-  set_source_files_properties(gdn.cpp PROPERTIES COMPILE_OPTIONS
-    "$<$<CXX_COMPILER_ID:GNU>:-ffp-contract=fast>;$<$<CXX_COMPILER_ID:Clang,AppleClang>:-ffp-contract=on>")
-  target_compile_features(flag_gems_arm_native PRIVATE cxx_std_17)
-  # Bind the dense KAI implementation locally. Routed expert operations
-  # explicitly resolve Torch's packed-weight ABI in runtime_kai.h.
-  if(UNIX AND NOT APPLE)
-    target_link_options(flag_gems_arm_native PRIVATE "LINKER:-Bsymbolic-functions")
-  endif()
-  if(FLAGGEMS_INSTALL)
-    install(TARGETS flag_gems_arm_native
-      LIBRARY DESTINATION flag_gems/runtime/backend/_arm/tle_raw/lib)
+  if(FLAGGEMS_BUILD_ARM_ELEMENTWISE)
+    add_library(flag_gems_arm_elementwise SHARED elementwise.cpp)
+    target_link_libraries(flag_gems_arm_elementwise PRIVATE Torch::Torch "${_torch_omp}")
+    # Preserve ATen's vector/moments contraction and BF16 rounding schedule.
+    target_compile_options(flag_gems_arm_elementwise PRIVATE ${_omp_compile_flags} -O3 -ffp-contract=on)
+    if(FLAGGEMS_INSTALL)
+      install(TARGETS flag_gems_arm_elementwise
+        LIBRARY DESTINATION flag_gems/runtime/backend/_arm/tle_raw/lib)
+    endif()
   endif()
 endif()
 if(FLAGGEMS_INSTALL)

@@ -1158,3 +1158,83 @@ def test_arm_gdn_fake_mutation_schema(native):
             )
             is None
         )
+
+
+@pytest.fixture(scope="module")
+def arm_bf16_elementwise():
+    suffix = "dylib" if sys.platform == "darwin" else "so"
+    default = (
+        Path(__file__).resolve().parents[1]
+        / "src/flag_gems/runtime/backend/_arm/tle_raw/lib"
+        / f"libflag_gems_arm_elementwise.{suffix}"
+    )
+    if not Path(
+        os.environ.get("FLAGGEMS_ARM_ELEMENTWISE_LIBRARY", str(default))
+    ).is_file():
+        pytest.skip("build FLAGGEMS_BUILD_ARM_ELEMENTWISE=ON")
+    from flag_gems.runtime.backend._arm.fused.prepared_elementwise import (
+        PreparedAddLayerNormRaw,
+        PreparedGeluErfRaw,
+    )
+
+    return PreparedGeluErfRaw, PreparedAddLayerNormRaw
+
+
+def test_arm_bf16_gelu_complete_domain_and_tails(arm_bf16_elementwise):
+    PreparedGeluErfRaw, _ = arm_bf16_elementwise
+    import torch.nn.functional as F
+
+    previous = torch.get_num_threads()
+    generator = torch.Generator().manual_seed(1029)
+    domain = (
+        torch.arange(65536, dtype=torch.int32).to(torch.uint16).view(torch.bfloat16)
+    )
+    try:
+        with torch.inference_mode():
+            op = PreparedGeluErfRaw(threads=4)
+            for threads in [1, 4, 18]:
+                torch._C.set_num_threads(threads)
+                for x in [
+                    domain,
+                    domain[torch.randperm(65536, generator=generator)].repeat(3),
+                    torch.randn(17, 67, generator=generator).bfloat16(),
+                    torch.empty(0, 4096, dtype=torch.bfloat16),
+                ]:
+                    expected = F.gelu(x, approximate="none")
+                    actual = op(x)
+                    torch.testing.assert_close(
+                        actual, expected, atol=0, rtol=0, equal_nan=True
+                    )
+    finally:
+        torch._C.set_num_threads(previous)
+
+
+def test_arm_bf16_residual_norm_rounding_and_tails(arm_bf16_elementwise):
+    _, PreparedAddLayerNormRaw = arm_bf16_elementwise
+    import torch.nn.functional as F
+
+    generator = torch.Generator().manual_seed(1030)
+    with torch.inference_mode():
+        for m, n in [(0, 1024), (1, 1), (17, 67), (32, 1024), (128, 1024)]:
+            w = torch.randn(n, generator=generator).bfloat16()
+            b = torch.randn(n, generator=generator).bfloat16()
+            op = PreparedAddLayerNormRaw(w, b, 1e-5, threads=4)
+            for scale in [0.0, 1e-4, 1.0, 1000.0]:
+                x = (torch.randn(m, n, generator=generator) * scale).bfloat16()
+                residual = torch.randn(m, n, generator=generator).bfloat16()
+                expected = F.layer_norm(x + residual, (n,), w, b, 1e-5)
+                actual = op(x, residual)
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_arm_bf16_elementwise_invalid_inputs(arm_bf16_elementwise):
+    _, PreparedAddLayerNormRaw = arm_bf16_elementwise
+    w = torch.ones(1024, dtype=torch.bfloat16)
+    op = PreparedAddLayerNormRaw(w, w)
+    x = torch.ones(2, 1024, dtype=torch.bfloat16)
+    with pytest.raises(ValueError):
+        op(x.float(), x.float())
+    with pytest.raises(ValueError):
+        op(x[:, ::2], x[:, ::2])
+    with pytest.raises(RuntimeError), torch.enable_grad():
+        op(x.requires_grad_(), x)
