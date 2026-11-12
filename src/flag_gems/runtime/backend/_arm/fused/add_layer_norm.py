@@ -46,4 +46,3 @@ def add_layer_norm(x, residual, weight, bias, eps=1e-5, *, threads=8):
         _add_layer_norm[(rows,)](x,residual,weight,bias,y,EPS=eps,N=n,
             BLOCK=triton.next_power_of_2(n),num_cpu_threads=threads,enable_fp_fusion=False)
     return y
-
