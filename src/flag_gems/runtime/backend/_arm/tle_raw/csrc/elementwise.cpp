@@ -15,6 +15,32 @@ using B = c10::BFloat16;
 using BV = at::vec::Vectorized<B>;
 using FV = at::vec::Vectorized<float>;
 
+// Apply a caller-owned complete BF16 mapping. This entry does no floating
+// arithmetic or activation dispatch and preserves every output bit pattern.
+extern "C" void flag_gems_arm_bf16_lookup(uint64_t address) {
+  const auto* d = reinterpret_cast<const int64_t*>(address);
+  const auto* x = reinterpret_cast<const uint16_t*>(d[0]);
+  const auto* table = reinterpret_cast<const uint16_t*>(d[1]);
+  auto* y = reinterpret_cast<uint16_t*>(d[2]);
+  const int64_t n = d[3];
+  const int threads = int(d[4]);
+  // Independent lookups expose memory-level parallelism on NEON cores, which
+  // do not have a general vector gather instruction.
+#pragma omp parallel for num_threads(threads) schedule(static)
+  for (int64_t block = 0; block < n / 8; ++block) {
+    const int64_t i = block * 8;
+    y[i] = table[x[i]];
+    y[i + 1] = table[x[i + 1]];
+    y[i + 2] = table[x[i + 2]];
+    y[i + 3] = table[x[i + 3]];
+    y[i + 4] = table[x[i + 4]];
+    y[i + 5] = table[x[i + 5]];
+    y[i + 6] = table[x[i + 6]];
+    y[i + 7] = table[x[i + 7]];
+  }
+  for (int64_t i = n / 8 * 8; i < n; ++i) y[i] = table[x[i]];
+}
+
 extern "C" void flag_gems_arm_add_layer_norm_bf16(uint64_t address) {
   const auto* d = reinterpret_cast<const int64_t*>(address);
   const auto* x = reinterpret_cast<const B*>(d[0]);
@@ -51,6 +77,26 @@ extern "C" void flag_gems_arm_add_layer_norm_bf16(uint64_t address) {
       for (; j < n; ++j) y[i * n + j] = B((float(row[j]) * scale + shift) * float(w[j]) + float(b[j]));
     }
   }
+}
+
+// Preparation only: expose both ATen mappings and its vector width. The
+// Triton compute kernel uses the same logical vector/tail boundaries as ATen.
+extern "C" void flag_gems_arm_prepare_gelu_bf16_tables(uint64_t address) {
+  const auto* d = reinterpret_cast<const int64_t*>(address);
+  auto* vector_table = reinterpret_cast<B*>(d[0]);
+  auto* scalar_table = reinterpret_cast<B*>(d[1]);
+  auto* vector_span = reinterpret_cast<int64_t*>(d[2]);
+  alignas(64) uint16_t bits[BV::size()];
+  for (int i = 0; i < 65536; i += BV::size()) {
+    for (int j = 0; j < BV::size(); ++j) bits[j] = uint16_t(i + j);
+    at::native::vectorized_gelu<B>(BV::loadu(bits)).store(vector_table + i);
+    for (int j = 0; j < BV::size(); ++j) {
+      B value;
+      std::memcpy(&value, bits + j, sizeof(value));
+      scalar_table[i + j] = at::native::scalar_gelu<B>(value);
+    }
+  }
+  *vector_span = 2 * BV::size();
 }
 
 // Complete BF16 mapping of ATen's vector erf-GELU, without interpolation or

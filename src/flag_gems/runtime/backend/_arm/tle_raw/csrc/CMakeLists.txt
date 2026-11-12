@@ -101,11 +101,13 @@ endif()
 option(FLAGGEMS_BUILD_ARM_KAI "Build Arm quantized GEMM and routed MoE" OFF)
 option(FLAGGEMS_BUILD_ARM_STANDALONE "Build independent W8A8 and GDN without KleidiAI" OFF)
 option(FLAGGEMS_BUILD_ARM_GDN "Include Arm GDN and normalization in the inference library" ON)
+option(FLAGGEMS_BUILD_ARM_W8A8_I8MM "Build prepared W8A8 I8MM Raw operators" OFF)
+option(FLAGGEMS_BUILD_ARM_BGE_SME "Build Apple BGE SME and BF16 Raw operators" OFF)
 option(FLAGGEMS_BUILD_ARM_ELEMENTWISE "Build BF16 residual LayerNorm and exact GELU CPU Raw leaves" OFF)
 if(FLAGGEMS_BUILD_ARM_KAI AND FLAGGEMS_BUILD_ARM_STANDALONE)
   message(FATAL_ERROR "Choose either ARM_KAI or ARM_STANDALONE")
 endif()
-if(FLAGGEMS_BUILD_ARM_KAI OR FLAGGEMS_BUILD_ARM_STANDALONE OR FLAGGEMS_BUILD_ARM_ELEMENTWISE)
+if(FLAGGEMS_BUILD_ARM_KAI OR FLAGGEMS_BUILD_ARM_STANDALONE OR FLAGGEMS_BUILD_ARM_ELEMENTWISE OR FLAGGEMS_BUILD_ARM_W8A8_I8MM OR FLAGGEMS_BUILD_ARM_BGE_SME)
  if(FLAGGEMS_BUILD_ARM_KAI)
   set(KLEIDIAI_ROOT "" CACHE PATH "KleidiAI 1.29 source/include directory")
   set(KLEIDIAI_LIBRARY "" CACHE FILEPATH "KleidiAI static library")
@@ -163,6 +165,61 @@ if(FLAGGEMS_BUILD_ARM_KAI OR FLAGGEMS_BUILD_ARM_STANDALONE OR FLAGGEMS_BUILD_ARM
     endif()
     if(FLAGGEMS_INSTALL)
       install(TARGETS flag_gems_arm_native
+        LIBRARY DESTINATION flag_gems/runtime/backend/_arm/tle_raw/lib)
+    endif()
+  endif()
+  if(FLAGGEMS_BUILD_ARM_BGE_SME)
+    if(NOT APPLE)
+      message(FATAL_ERROR "BGE SME targets currently require the validated Apple compiler profile")
+    endif()
+    function(flaggems_bge_sme_target name)
+      add_library(${name} SHARED ${ARGN})
+      target_link_libraries(${name} PRIVATE Torch::Torch "${_torch_omp}")
+      target_compile_options(${name} PRIVATE ${_omp_compile_flags} -O3
+        -mcpu=apple-m4 -ffp-contract=off)
+      if(FLAGGEMS_INSTALL)
+        install(TARGETS ${name}
+          LIBRARY DESTINATION flag_gems/runtime/backend/_arm/tle_raw/lib)
+      endif()
+    endfunction()
+    flaggems_bge_sme_target(flag_gems_arm_bf16_sme bf16_sme.cpp)
+    flaggems_bge_sme_target(flag_gems_arm_w8a8_sme w8a8_sme.cpp)
+    flaggems_bge_sme_target(flag_gems_arm_w8a8_add_norm
+      w8a8_sme.cpp w8a8_add_norm.cpp)
+    target_compile_definitions(flag_gems_arm_w8a8_add_norm PRIVATE
+      FLAGGEMS_ARM_FUSED_NORM=1 FLAGGEMS_W8_NORM_ONLY=1)
+    flaggems_bge_sme_target(flag_gems_arm_w8a8_ffn
+      w8a8_sme.cpp w8a8_add_norm.cpp raw_dispatch.cpp)
+    target_compile_definitions(flag_gems_arm_w8a8_ffn PRIVATE
+      FLAGGEMS_W8_SME_ROW_STORE=1 FLAGGEMS_W8_NEON_RESERVE=2
+      FLAGGEMS_W8_SME_HOIST_EPILOGUE=1 FLAGGEMS_W8_PACK8=1
+      FLAGGEMS_W8_FFN_GELU_SCALE=1 FLAGGEMS_W8_FFN_GELU_SUBTEAM=1
+      FLAGGEMS_W8_FFN_MAX_ROWS=128 FLAGGEMS_W8_FFN_TENSOR_RAW=1
+      FLAGGEMS_W8_FFN_ONLY=1)
+    flaggems_bge_sme_target(flag_gems_arm_attention_sme attention_sme.cpp)
+    target_compile_definitions(flag_gems_arm_attention_sme PRIVATE
+      FLAGGEMS_ATTN_BFMOPA=1 FLAGGEMS_ATTN_FULL_K=1 FLAGGEMS_ATTN_SUM16=1 FLAGGEMS_ATTN_NATIVE_SOFTMAX=1
+      FLAGGEMS_ATTN_NATIVE_PROB=1)
+    set_source_files_properties(w8a8_add_norm.cpp PROPERTIES COMPILE_OPTIONS
+      "-ffp-contract=on")
+  endif()
+  if(FLAGGEMS_BUILD_ARM_W8A8_I8MM)
+    add_library(flag_gems_arm_w8g32_i8mm SHARED
+      w8a8_i8mm.cpp w8a8_add_norm.cpp raw_dispatch.cpp)
+    set_target_properties(flag_gems_arm_w8g32_i8mm PROPERTIES CXX_STANDARD 17)
+    target_link_libraries(flag_gems_arm_w8g32_i8mm PRIVATE Torch::Torch "${_torch_omp}")
+    target_compile_options(flag_gems_arm_w8g32_i8mm PRIVATE
+      ${_omp_compile_flags} -O3 -ffp-contract=off -march=armv8.6-a+i8mm)
+    target_compile_definitions(flag_gems_arm_w8g32_i8mm PRIVATE
+      FLAGGEMS_ARM_I8MM_TENSOR_RAW=1 FLAGGEMS_I8MM_K_UNROLL=4
+      FLAGGEMS_I8MM_DYNAMIC_CHUNK=16)
+    set_source_files_properties(w8a8_add_norm.cpp PROPERTIES COMPILE_OPTIONS
+      "$<$<CXX_COMPILER_ID:GNU>:-ffp-contract=fast>;$<$<CXX_COMPILER_ID:Clang,AppleClang>:-ffp-contract=on>")
+    if(UNIX AND NOT APPLE)
+      target_link_options(flag_gems_arm_w8g32_i8mm PRIVATE "LINKER:-Bsymbolic-functions")
+    endif()
+    if(FLAGGEMS_INSTALL)
+      install(TARGETS flag_gems_arm_w8g32_i8mm
         LIBRARY DESTINATION flag_gems/runtime/backend/_arm/tle_raw/lib)
     endif()
   endif()

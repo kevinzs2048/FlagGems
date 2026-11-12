@@ -1180,7 +1180,8 @@ def arm_bf16_elementwise():
     return PreparedGeluErfRaw, PreparedAddLayerNormRaw
 
 
-def test_arm_bf16_gelu_complete_domain_and_tails(arm_bf16_elementwise):
+@pytest.mark.parametrize("backend", ["raw", "triton"])
+def test_arm_bf16_gelu_complete_domain_and_tails(arm_bf16_elementwise, backend):
     PreparedGeluErfRaw, _ = arm_bf16_elementwise
     import torch.nn.functional as F
 
@@ -1191,7 +1192,14 @@ def test_arm_bf16_gelu_complete_domain_and_tails(arm_bf16_elementwise):
     )
     try:
         with torch.inference_mode():
-            op = PreparedGeluErfRaw(threads=4)
+            if backend == "triton":
+                from flag_gems.runtime.backend._arm.fused.prepared_elementwise import (
+                    PreparedGeluErfTriton,
+                )
+
+                op = PreparedGeluErfTriton(threads=4)
+            else:
+                op = PreparedGeluErfRaw(threads=4)
             for threads in [1, 4, 18]:
                 torch._C.set_num_threads(threads)
                 for x in [
@@ -1238,3 +1246,61 @@ def test_arm_bf16_elementwise_invalid_inputs(arm_bf16_elementwise):
         op(x[:, ::2], x[:, ::2])
     with pytest.raises(RuntimeError), torch.enable_grad():
         op(x.requires_grad_(), x)
+
+
+@pytest.fixture(params=["triton", "raw"])
+def bf16_lookup_implementation(request):
+    if os.environ.get("FLAGGEMS_ARM_REQUIRE_NATIVE_TESTS") == "1":
+        from triton.language.extra.cpu import tle_ops  # noqa: F401
+    else:
+        pytest.importorskip("triton.language.extra.cpu.tle_ops")
+    if request.param == "raw":
+        request.getfixturevalue("arm_bf16_elementwise")
+    from flag_gems.runtime.backend._arm.fused import prepared_elementwise
+
+    name = "PreparedBF16LookupRaw" if request.param == "raw" else "PreparedBF16Lookup"
+    return getattr(prepared_elementwise, name)
+
+
+def test_arm_bf16_lookup_complete_domain_and_tails(bf16_lookup_implementation):
+    # A permutation includes every bit encoding, including signed zeros and
+    # NaN payloads; compare integers without floating-point NaN equality rules.
+    generator = torch.Generator().manual_seed(1108)
+    bits = torch.arange(65536, dtype=torch.int32).to(torch.int16)
+    table = bits[torch.randperm(65536, generator=generator)].view(torch.bfloat16)
+    op = bf16_lookup_implementation(table, threads=2)
+    with torch.inference_mode():
+        for size in [0, 1, 63, 64, 65, 65536, 65537]:
+            indices = torch.arange(size) % 65536
+            x = bits[indices].view(torch.bfloat16)
+            output = op(x)
+            assert torch.equal(
+                output.view(torch.int16), table.view(torch.int16)[indices]
+            )
+            assert output.shape == x.shape
+            if size:
+                assert output.data_ptr() != x.data_ptr()
+
+
+def test_arm_bf16_lookup_contract(bf16_lookup_implementation):
+    table = torch.zeros(65536, dtype=torch.bfloat16)
+    invalid_tables = [
+        table.float(),
+        table[:10],
+        torch.empty(131072, dtype=torch.bfloat16)[::2],
+    ]
+    for invalid in invalid_tables:
+        with pytest.raises(ValueError):
+            bf16_lookup_implementation(invalid)
+    for threads in [0, -1, True, 1.5]:
+        with pytest.raises(ValueError):
+            bf16_lookup_implementation(table, threads=threads)
+    with pytest.raises(ValueError):
+        bf16_lookup_implementation(table.clone().requires_grad_())
+    op = bf16_lookup_implementation(table, threads=1)
+    with pytest.raises(ValueError):
+        op(torch.ones(8))
+    with pytest.raises(ValueError):
+        op(torch.ones(8, dtype=torch.bfloat16)[::2])
+    with pytest.raises(RuntimeError), torch.enable_grad():
+        op(torch.ones(8, dtype=torch.bfloat16, requires_grad=True))

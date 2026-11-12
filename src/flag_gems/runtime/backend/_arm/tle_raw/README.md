@@ -359,3 +359,24 @@ Measure the native and selected Triton/Raw paths with matching inputs, shapes,
 packing and thread counts on each target. Operator tests do not establish
 whole-model speed or CIX P1 acceptance; keep benchmark evidence outside this
 library's source tree.
+
+## BGE prepared CPU operators
+
+The `bge-m3` branch adds explicit opt-in targets in the existing `csrc`
+CMake project. Use `FLAGGEMS_BUILD_ARM_W8A8_I8MM=ON` for prepared per-output-channel
+W8 and dynamic per-token A8 on I8MM-capable AArch64 hosts, and
+`FLAGGEMS_BUILD_ARM_ELEMENTWISE=ON` for the BF16 elementwise leaves. The
+historical output name `flag_gems_arm_w8g32_i8mm` does not imply group-32
+weight quantization for BGE. These targets do not require KleidiAI.
+
+`FLAGGEMS_BUILD_ARM_BGE_SME=ON` builds the qualified Apple SME reference
+libraries, including typed FFN and noncausal attention. This target is
+Apple-only and is not a portable Kunpeng SME profile. All targets link the
+OpenMP runtime from the selected Torch installation. Preserve the per-source
+floating-point contraction flags: changing them can alter BF16 rounding.
+
+Model registration, NUMA placement and request policies belong to
+vLLM-Plugin-FL. See its `examples/bge_m3/README.md` on the matching branch for
+the server test procedure. The operator sources and existing numerical tests
+are committed here; model files, calibration assets and benchmark logs are
+not bundled into this repository.
